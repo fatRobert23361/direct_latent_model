@@ -101,20 +101,23 @@ class CoconutWithTranslator(nn.Module):
                     active_indices.append(b_idx)
                     filling_indices.append((b_idx, token_idx))
 
-            # Bug1修复：用 tensor_list 方式重建 inputs_embeds，避免原地操作破坏计算图
-            # 原先直接 inputs_embeds[b_idx, token_idx, :] = ... 是对计算图中张量的原地写入，
-            # 会导致 autograd 梯度错误。参照 coconut.py 的 tensor_list + torch.stack 方案。
+            # index_put（非原地）替换指定位置的 embedding：
+            # 相比原先的 tensor_list + torch.stack 方案（O(batch×seq_len) Python 循环），
+            # 这里只构造填充位置的索引和值，单次 GPU kernel 完成写入，
+            # 且 index_put 有完整的 autograd 支持，不破坏计算图。
             if filling_indices:
-                tensor_list = [
-                    [inputs_embeds[batch_idx, pos, :] for pos in range(inputs_embeds.shape[1])]
-                    for batch_idx in range(inputs_embeds.shape[0])
-                ]
-                for (b_idx, token_idx), latent_vec in zip(filling_indices, current_pass_latents):
-                    tensor_list[b_idx][token_idx] = latent_vec.squeeze(0).squeeze(0)
-                inputs_embeds = torch.stack([
-                    torch.stack(tensor_list[batch_idx])
-                    for batch_idx in range(inputs_embeds.shape[0])
-                ])
+                batch_indices = torch.tensor(
+                    [b for b, _ in filling_indices], device=inputs_embeds.device
+                )
+                token_indices = torch.tensor(
+                    [t for _, t in filling_indices], device=inputs_embeds.device
+                )
+                new_values = torch.stack(
+                    [v.squeeze(0).squeeze(0) for v in current_pass_latents]
+                )
+                inputs_embeds = inputs_embeds.index_put(
+                    (batch_indices, token_indices), new_values
+                )
 
             # --- 计算该轮的翻译 Loss ---
             if current_pass_latents:
