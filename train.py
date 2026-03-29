@@ -121,7 +121,7 @@ def train():
         eos_token_id=tokenizer.eos_token_id,
         lambda_translator=cfg.get("lambda_translator", 0.5),
         c_thought=cfg.get("c_thought", 1),
-    ).to(device)
+    ).to(device).to(torch.bfloat16)
     
     # Bug3修复：checkpoint 只加载一次，同时用于恢复模型权重和优化器状态。
     # 原先加载了两次同一个文件（第一次 map_location="cpu"，第二次 map_location=device），
@@ -218,8 +218,9 @@ def train():
             
             for batch in pbar:
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                
-                outputs = model(**batch)
+
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = model(**batch)
                 loss = outputs.loss / cfg["gradient_accumulation_steps"]
                 loss.backward()
 
@@ -284,7 +285,8 @@ def evaluate_and_log_wandb(model, raw_val, tokenizer, stage, epoch, device, cfg,
     print(f"\n--- Calculating Validation Loss ---")
     for batch in tqdm(val_loss_loader, desc=f"Stage {stage} Val Loss"):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        outputs = model(**batch)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(**batch)
         total_val_loss += outputs.loss.item()
         total_val_coconut += outputs.coconut_loss.item()
         total_val_trans += outputs.translator_loss.item()
@@ -336,12 +338,13 @@ def evaluate_and_log_wandb(model, raw_val, tokenizer, stage, epoch, device, cfg,
         context_ids = input_ids[:, :first_pos]
         
         # 3. 跑一遍 Dummy Forward 拿取隐层向量 (不需要 labels)
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            labels=input_ids, 
-            position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0).to(device)
-        )
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                labels=input_ids,
+                position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0).to(device)
+            )
         
         # 解密隐藏思维
         decoded_thoughts_list = model.translate_latents(outputs.latent_states, context_ids, tokenizer, c_thought=cfg.get("c_thought", 1))

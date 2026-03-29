@@ -119,7 +119,7 @@ class CoconutWithTranslator(nn.Module):
             # --- 计算该轮的翻译 Loss ---
             if current_pass_latents:
                 
-                last_hidden_states.append(torch.cat([v.detach().cpu() for v in current_pass_latents], dim=0))
+                last_hidden_states.append(torch.cat([v.detach() for v in current_pass_latents], dim=0))
                 
                 if translator_labels is not None:
                     # 只取当前 step 对应的 c_thought 个 latent，不累积历史。
@@ -221,7 +221,7 @@ class CoconutWithTranslator(nn.Module):
             if latent_vec is None:
                 continue
 
-            cumulative_latents.append(latent_vec.to(self.base_causallm.device))
+            cumulative_latents.append(latent_vec)
 
             # 只在每组最后一个 latent 处解码
             if (i + 1) % c_thought != 0:
