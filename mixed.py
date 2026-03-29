@@ -125,13 +125,13 @@ class CoconutWithTranslator(nn.Module):
                 last_hidden_states.append(torch.cat([v.detach() for v in current_pass_latents], dim=0))
                 
                 if translator_labels is not None:
-                    # 只取当前 step 对应的 c_thought 个 latent，不累积历史。
-                    # 累积历史会导致高 stage 时输入序列线性增长，早期 latent 与
-                    # 当前步骤无关反而引入噪声，且让任务难度随 stage 递增。
+                    # 累积所有历史 latent 送给翻译器：实验表明历史上下文对
+                    # translator 预测当前步骤文本有显著帮助，去掉历史会导致
+                    # thought_accuracy 从 ~30% 骤降到 ~5%。
                     history_latents_for_active = []
                     for b_idx in active_indices:
-                        # 沿 seq 维度拼接最近的 c_thought 个 latent: (1, c_thought, hidden_size)
-                        history_seq = torch.cat(accumulated_latents[b_idx][-self.c_thought:], dim=1)
+                        # 沿 seq 维度拼接: (1, current_steps, hidden_size)
+                        history_seq = torch.cat(accumulated_latents[b_idx], dim=1)
                         history_latents_for_active.append(history_seq)
                     
                     # (num_active_in_batch, current_steps, hidden_size)
