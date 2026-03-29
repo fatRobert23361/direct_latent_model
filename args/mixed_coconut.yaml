@@ -1,6 +1,6 @@
 project: coconut-translator
-save_path: ./models/prosqa-coconut-hybrid_v6
-name: prosqa-coconut-hybrid-v6
+save_path: ./models/prosqa-coconut-hybrid_v7
+name: prosqa-coconut-hybrid-v7
 
 # 训练阶段控制
 epochs_per_stage: 8
@@ -12,7 +12,7 @@ no_cot: False
 
 # 翻译器相关 (混合 Loss 参数)
 lambda_translator: 0.5    # 翻译器 Loss 的最大权重（实际值 = 0.5 * stage/max_stage，动态递增）
-translator_lr: !!float "5e-5"
+translator_lr: !!float "5e-4"  # translator 独立 lr，建议为主模型 lr 的 3-5 倍
 warmup_steps_per_stage: 100  # 每个 stage 开始时的 LR warmup 步数
 
 # 基础训练参数

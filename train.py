@@ -138,8 +138,13 @@ def train():
     raw_train = get_dataset(cfg["train_path"], tokenizer)
     raw_val = get_dataset(cfg["val_path"], tokenizer)
 
-    # 9. 优化器
-    optimizer = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    # 9. 优化器：coconut 主干与 translator 使用独立的 param group，
+    # 允许为 translator 设置更高的 lr，且 stage 切换时可以只重置 translator 的 Adam state。
+    translator_lr = cfg.get("translator_lr", cfg["lr"] * 5)
+    optimizer = AdamW([
+        {"params": list(model.base_causallm.parameters()), "lr": cfg["lr"]},
+        {"params": list(model.translator.parameters()), "lr": translator_lr, "name": "translator"},
+    ], weight_decay=cfg["weight_decay"])
 
     if resume_ckpt is not None and "optimizer_state_dict" in resume_ckpt:
         optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
@@ -166,11 +171,18 @@ def train():
         model.lambda_translator = current_lambda
         print(f"lambda_translator = {current_lambda:.3f}")
 
-        # 问题3修复：每个 stage 开始时重置 LR 并启动 warmup 调度器。
-        # stage 切换时模型分布突变，直接用全量 LR 冲击会导致 loss 振荡，
-        # warmup 让参数在新分布下平稳过渡。
+        # 每个 stage 开始时重置 LR 并启动 warmup 调度器。
+        # 同时重置 translator param group 的 Adam 动量状态：
+        # latent 分布在 stage 切换时发生突变，旧的动量方向会误导 translator 更新。
+        translator_param_set = set(model.translator.parameters())
+        for p in list(translator_param_set):
+            if p in optimizer.state:
+                del optimizer.state[p]
         for pg in optimizer.param_groups:
-            pg['lr'] = cfg['lr']
+            if pg.get("name") == "translator":
+                pg["lr"] = translator_lr
+            else:
+                pg["lr"] = cfg["lr"]
         scheduler = LambdaLR(
             optimizer,
             lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps))
