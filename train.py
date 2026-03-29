@@ -337,21 +337,21 @@ def evaluate_and_log_wandb(model, raw_val, tokenizer, stage, epoch, device, cfg,
         first_pos = first_latent_pos[0, 0].item() if len(first_latent_pos) > 0 else input_ids.shape[1]
         context_ids = input_ids[:, :first_pos]
         
-        # 3. 跑一遍 Dummy Forward 拿取隐层向量 (不需要 labels)
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # 3. 跑一遍 Dummy Forward 拿取隐层向量 (不需要 labels)
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=torch.ones_like(input_ids),
                 labels=input_ids,
                 position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0).to(device)
             )
-        
-        # 解密隐藏思维
-        decoded_thoughts_list = model.translate_latents(outputs.latent_states, context_ids, tokenizer, c_thought=cfg.get("c_thought", 1))
+
+            # 解密隐藏思维
+            decoded_thoughts_list = model.translate_latents(outputs.latent_states, context_ids, tokenizer, c_thought=cfg.get("c_thought", 1))
+
+            # 正式生成回答 (调大 max_new_tokens 给模型留足空间)
+            gen_ids = model.generate(input_ids, tokenizer, max_new_tokens=150, show_thoughts=False)
         decoded_thoughts_text = {idx: text.strip() for idx, text in enumerate(decoded_thoughts_list)}
-        
-        # 正式生成回答 (调大 max_new_tokens 给模型留足空间)
-        gen_ids = model.generate(input_ids, tokenizer, max_new_tokens=150, show_thoughts=False)
         answer = tokenizer.decode(gen_ids[0], skip_special_tokens=True).strip()
         question = tokenizer.decode(context_ids[0], skip_special_tokens=True)
         pure_answer = answer.split("#")[-1].replace(",", "").strip()  # 假设答案格式是 "Thoughts... # Final Answer"
