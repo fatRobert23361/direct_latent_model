@@ -1,0 +1,43 @@
+project: coconut-translator
+save_path: ./models/prosqa-coconut-hybrid_ca_v1
+name: prosqa-coconut-hybrid-ca-v1
+
+# 训练阶段控制
+epochs_per_stage: 5
+max_latent_stage: 6
+c_thought: 2
+pad_latent_to_max: True
+uniform_prob: 0.1
+no_cot: False
+
+# 翻译器（Cross-Attention 版）
+# lambda_translator 实际值 = lambda_translator * stage/max_stage，随阶段线性递增
+lambda_translator: 0.5
+translator_lr: !!float "5e-4"
+warmup_steps_per_stage: 100
+
+# 基础训练参数
+model_id: openai-community/gpt2
+train_path: data/prosqa_train.json
+val_path: data/prosqa_valid.json
+batch_size_training: 8
+gradient_accumulation_steps: 4
+lr: !!float "1e-4"
+weight_decay: 0.01
+num_eval_samples: 300
+
+# 预训练权重路径
+# 从纯 Coconut checkpoint 开始（不加载旧的 soft-prompt 翻译器权重，cross-attn 结构不兼容）
+load_model_path: /home/haoyang/haoyang/coconut/models/nihaoyang2002-kth-royal-institute-of-technology/checkpoint_5
+load_translator_path: null
+
+# 恢复训练（从头开始时保持默认）
+resume_from_checkpoint: null
+resume_stage: 1
+resume_epoch: 0
+
+# 最后一个 stage 可以多跑一些 epoch 让翻译器充分收敛
+epochs_for_final_stage: 20
+
+debug: false
+bf16: true
