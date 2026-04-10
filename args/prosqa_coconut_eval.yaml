@@ -19,7 +19,7 @@ pad_latent_to_max: True
 save_only_improve: False
 uniform_prob: 0.0
 model_id: openai-community/gpt2
-load_model_path: /home/haoyang/haoyang/coconut/models/prosqa-coconut/checkpoint_42
+load_model_path: /home/haoyang/haoyang/coconut/models/prosqa-coconut/checkpoint_40
 seed: 0
 resume: 40
 bf16: False

@@ -1,0 +1,35 @@
+# No-thoughts baseline for ProsQA (direct Q->A, no reasoning steps)
+# need 4 gpus
+
+project: coconut-baselines
+save_path: /home/haoyang/haoyang/coconut/models
+name: prosqa-no-thoughts
+
+only_eval: False
+
+coconut: False
+cot: False
+no_thoughts: False
+no_cot: True
+
+c_thought: 0
+epochs_per_stage: 1
+max_latent_stage: 0
+pad_latent_to_max: False
+
+save_only_improve: True
+uniform_prob: 0.0
+model_id: openai-community/gpt2
+load_model_path: None
+seed: 0
+resume: 0
+bf16: False
+train_path: data/prosqa_train.json
+val_path: data/prosqa_valid.json
+reset_optimizer: False
+batch_size_training: 32
+debug: False
+gradient_accumulation_steps: 1
+num_epochs: 50
+lr: !!float "1e-4"
+weight_decay: 0.01

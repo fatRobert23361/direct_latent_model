@@ -9,3 +9,5 @@ translator_models/
 extracted_dataset_test/
 coconut_prosqa_gpt2_context_test/Miniconda3-latest-Linux-x86_64.sh
 doc/
+results/
+CLAUDE.md
