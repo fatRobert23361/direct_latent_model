@@ -17,7 +17,9 @@ import argparse
 import json
 import os
 import copy
+import random
 
+import numpy as np
 import torch
 import wandb
 from tqdm import tqdm
@@ -30,6 +32,9 @@ from mixed import CoconutWithTranslator
 from mixed_dataset import get_cot_latent_dataset, MyCollator, get_question_latent_dataset
 from dataset import get_dataset
 from translator_v3 import CoconutTranslator
+
+# 所有 uniform_prob run 共用同一随机种子，保证单一变量
+GLOBAL_SEED = 42
 
 # -----------------------------------------------------------------------
 # 固定超参（从 mixed_coconut.yaml 中提取，不参与 sweep）
@@ -307,6 +312,16 @@ def train_one_prob(uniform_prob, cfg, raw_train, raw_val, raw_test,
     print(f"Training: uniform_prob = {uniform_prob}  (run: {run_name})")
     print(f"{'='*60}")
 
+    # 每个 run 使用相同种子，确保 model 初始化、数据 shuffle 顺序一致，只有 uniform_prob 不同
+    seed = cfg.get("seed", GLOBAL_SEED)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+    print(f"  Random seed fixed to {seed}")
+
     # 每次从头构建 tokenizer / model
     tokenizer, latent_id, start_id, end_id = build_tokenizer_and_ids(cfg["model_id"])
 
@@ -363,11 +378,15 @@ def train_one_prob(uniform_prob, cfg, raw_train, raw_val, raw_test,
             eos_id=tokenizer.eos_token_id,
         )
         collator    = MyCollator(tokenizer=tokenizer, latent_id=latent_id)
+        # generator 固定每个 stage 的 shuffle 顺序（seed + stage 组合保证 stage 间顺序不同但跨 run 一致）
+        g = torch.Generator()
+        g.manual_seed(seed + stage)
         train_loader = DataLoader(
             train_ds,
             batch_size=cfg["batch_size_training"],
             shuffle=True,
             collate_fn=collator,
+            generator=g,
         )
 
         for epoch in range(target_epochs):
