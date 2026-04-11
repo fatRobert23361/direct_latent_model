@@ -2,21 +2,21 @@
 train_uniform_sweep.py
 
 在 ProsQA 上以不同 uniform_prob 值扫描训练 CoconutWithTranslator 模型。
-每个 uniform_prob 启动一个独立的 wandb run，每个 epoch 在 val 和 test
-两个集合上评估，只保存 test accuracy 最高的 checkpoint。
+训练逻辑与 train.py 完全一致，额外增加：
+  - test 集每 epoch 评估
+  - 只保存 test accuracy 最高的 checkpoint
+  - 最后一个 stage 的 early stopping（至少跑 min_epochs 后才触发）
 
 uniform_prob 取值：0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9
 
 用法：
     python train_uniform_sweep.py
-    python train_uniform_sweep.py --probs 0.3 0.5      # 只跑部分值
-    python train_uniform_sweep.py --start_stage 3      # 从指定 stage 开始（接续训练）
+    python train_uniform_sweep.py --probs 0.3 0.5
 """
 
 import argparse
 import json
 import os
-import copy
 import random
 
 import numpy as np
@@ -33,100 +33,242 @@ from mixed_dataset import get_cot_latent_dataset, MyCollator, get_question_laten
 from dataset import get_dataset
 from translator_v3 import CoconutTranslator
 
-# 所有 uniform_prob run 共用同一随机种子，保证单一变量
 GLOBAL_SEED = 42
-
-# -----------------------------------------------------------------------
-# 固定超参（从 mixed_coconut.yaml 中提取，不参与 sweep）
-# -----------------------------------------------------------------------
-BASE_CFG = {
-    "project":                    "coconut-translator-uniform-sweep",
-    "model_id":                   "openai-community/gpt2",
-    "train_path":                 "data/prosqa_train.json",
-    "val_path":                   "data/prosqa_valid.json",
-    "test_path":                  "data/prosqa_test.json",
-    "load_model_path":            "/home/haoyang/haoyang/coconut/models/nihaoyang2002-kth-royal-institute-of-technology/checkpoint_5",
-    "load_translator_path":       None,
-    "save_base_path":             "./models/uniform_sweep",
-
-    # 训练阶段
-    "max_latent_stage":           6,
-    "epochs_per_stage":           5,
-    "epochs_for_final_stage":     20,   # 最后 stage 多训
-    "c_thought":                  1,
-    "pad_latent_to_max":          True,
-    "no_cot":                     False,
-
-    # 翻译器
-    "lambda_translator":          0.5,
-    "translator_lr":              5e-4,
-    "warmup_steps_per_stage":     100,
-
-    # 优化器
-    "lr":                         1e-4,
-    "weight_decay":               0.01,
-    "batch_size_training":        8,
-    "gradient_accumulation_steps": 4,
-
-    # 评估
-    "num_eval_samples":           500,   # val/test 各评估多少条
-
-    # Early stopping（仅在最后一个 stage 生效）
-    # 监控指标：test accuracy（与 checkpoint 保存标准一致）
-    "early_stopping_patience":    4,     # 连续多少个 epoch test acc 不改善则停止训练
-    "early_stopping_min_epochs":  5,     # 最后 stage 至少跑多少 epoch 才允许触发
-}
 
 UNIFORM_PROBS = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
+# 与 mixed_coconut.yaml 对齐
+BASE_CFG = {
+    "project":                     "coconut-translator-uniform-sweep",
+    "model_id":                    "openai-community/gpt2",
+    "train_path":                  "data/prosqa_train.json",
+    "val_path":                    "data/prosqa_valid.json",
+    "test_path":                   "data/prosqa_test.json",
+    "load_model_path":             "/home/haoyang/haoyang/coconut/models/nihaoyang2002-kth-royal-institute-of-technology/checkpoint_5",
+    "load_translator_path":        None,
+    "save_base_path":              "./models/uniform_sweep",
 
-# -----------------------------------------------------------------------
-# 工具函数
-# -----------------------------------------------------------------------
+    "max_latent_stage":            6,
+    "epochs_per_stage":            5,
+    "epochs_for_final_stage":      20,
+    "c_thought":                   1,
+    "pad_latent_to_max":           True,
+    "no_cot":                      False,
 
-def make_cfg_obj(d):
-    """把 dict 包成有 getattr 和 get 的对象，兼容 dataset 函数的 configs 参数。"""
-    class Cfg:
-        def __init__(self, d):
-            for k, v in d.items():
-                setattr(self, k, v)
-        def get(self, k, default=None):
-            return getattr(self, k, default)
-    return Cfg(d)
+    "lambda_translator":           0.5,
+    "translator_lr":               5e-4,
+    "warmup_steps_per_stage":      100,
+
+    "lr":                          1e-4,
+    "weight_decay":                0.01,
+    "batch_size_training":         8,
+    "gradient_accumulation_steps": 4,
+
+    "num_eval_samples":            500,
+
+    # Early stopping（仅最后一个 stage 生效）
+    "early_stopping_patience":     8,
+    "early_stopping_min_epochs":   5,
+}
 
 
-def build_tokenizer_and_ids(model_id):
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+def save_checkpoint(model, optimizer, stage, epoch, path, name):
+    os.makedirs(path, exist_ok=True)
+    save_dict = {
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "stage":                stage,
+        "epoch":                epoch,
+    }
+    torch.save(save_dict, os.path.join(path, f"{name}_best.pt"))
+    print(f"  [Checkpoint] Saved best → {os.path.join(path, f'{name}_best.pt')}")
+
+
+@torch.no_grad()
+def evaluate_and_log(model, raw_val, raw_test, tokenizer, stage, epoch,
+                     device, cfg, latent_id, start_id, end_id):
+    """val 和 test 各跑一遍，返回 (val_acc, test_acc)。逻辑与 train.py 完全一致。"""
+    model.eval()
+
+    def run_eval(raw_ds, tag):
+        num_eval = min(cfg.get("num_eval_samples", 300), len(raw_ds))
+        eval_raw = raw_ds.select(range(num_eval))
+
+        # --- Loss ---
+        eval_loss_ds = get_cot_latent_dataset(
+            scheduled_stage=stage,
+            base_dataset=eval_raw,
+            configs=type('obj', (object,), {**cfg, 'uniform_prob': 0.0}),
+            start_id=start_id,
+            latent_id=latent_id,
+            end_id=end_id,
+            shuffle=False,
+            eos_id=tokenizer.eos_token_id,
+        )
+        collator    = MyCollator(tokenizer=tokenizer, latent_id=latent_id)
+        loss_loader = DataLoader(eval_loss_ds, batch_size=cfg["batch_size_training"],
+                                 collate_fn=collator)
+
+        total_loss, total_coco, total_trans = 0.0, 0.0, 0.0
+        for batch in tqdm(loss_loader, desc=f"Stage {stage} {tag} Loss"):
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
+            outputs = model(**batch)
+            total_loss  += outputs.loss.item()
+            total_coco  += outputs.coconut_loss.item()
+            total_trans += outputs.translator_loss.item()
+        n = len(loss_loader)
+        avg_loss, avg_coco, avg_trans = total_loss / n, total_coco / n, total_trans / n
+        print(f"  {tag} Loss: {avg_loss:.4f} (Coconut: {avg_coco:.4f}, Translator: {avg_trans:.4f})")
+
+        # --- Generation Accuracy ---
+        eval_gen_ds = get_question_latent_dataset(
+            scheduled_stage=stage,
+            base_dataset=eval_raw,
+            configs=type('obj', (object,), cfg),
+            start_id=start_id,
+            latent_id=latent_id,
+            end_id=end_id,
+        )
+
+        table = wandb.Table(columns=[
+            "Stage", "Epoch", "Question",
+            "GT_Thoughts", "Decoded_Thoughts",
+            "GT_Answer", "Generated_Answer", "Answer_Match"
+        ])
+
+        correct_answers, correct_thoughts, total_thoughts = 0, 0, 0
+
+        for i in tqdm(range(num_eval), desc=f"Eval Gen Stage {stage} {tag}"):
+            sample_gen = eval_gen_ds[i]
+            raw_sample  = eval_raw[i]
+
+            gt_answer   = str(raw_sample["answer"]).strip()
+            gt_steps    = raw_sample["steps"]
+            gt_thoughts = {idx: step.strip() for idx, step in enumerate(gt_steps[:stage])}
+
+            input_ids = torch.tensor(sample_gen["input_ids"]).unsqueeze(0).to(device)
+
+            first_latent_pos = (input_ids[0] == latent_id).nonzero()
+            first_pos = first_latent_pos[0, 0].item() if len(first_latent_pos) > 0 else input_ids.shape[1]
+            context_ids = input_ids[:, :first_pos]
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                labels=input_ids,
+                position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0).to(device),
+            )
+            decoded_thoughts_list = model.translate_latents(
+                outputs.latent_states, context_ids, tokenizer,
+                c_thought=cfg.get("c_thought", 1)
+            )
+            decoded_thoughts = {idx: t.strip() for idx, t in enumerate(decoded_thoughts_list)}
+
+            gen_ids     = model.generate(input_ids, tokenizer, max_new_tokens=150, show_thoughts=False)
+            answer      = tokenizer.decode(gen_ids[0], skip_special_tokens=True).strip()
+            pure_answer = answer.split("#")[-1].replace(",", "").strip()
+            question    = tokenizer.decode(context_ids[0], skip_special_tokens=True)
+
+            answer_is_correct = (gt_answer == pure_answer)
+            if answer_is_correct:
+                correct_answers += 1
+
+            for idx, gt_step in gt_thoughts.items():
+                clean_gt  = gt_step.replace(" ", "").replace("\n", "").lower()
+                clean_dec = decoded_thoughts.get(idx, "").replace(" ", "").replace("\n", "").lower()
+                if clean_gt and clean_gt == clean_dec:
+                    correct_thoughts += 1
+                elif not clean_gt and not clean_dec:
+                    correct_thoughts += 1
+                total_thoughts += 1
+
+            if i < 5:
+                gt_str  = "\n".join([f"Thought {k+1}: {v}" for k, v in gt_thoughts.items()])
+                dec_str = "\n".join([f"Thought {k+1}: {v}" for k, v in decoded_thoughts.items()])
+                table.add_data(stage, epoch, question, gt_str, dec_str,
+                               gt_answer, answer, answer_is_correct)
+
+        ans_acc     = correct_answers / num_eval
+        thought_acc = correct_thoughts / total_thoughts if total_thoughts > 0 else 0.0
+        print(f"  [{tag}] Answer Acc: {ans_acc*100:.2f}%  Thought Acc: {thought_acc*100:.2f}%")
+        return avg_loss, avg_coco, avg_trans, ans_acc, thought_acc, table
+
+    val_loss,  val_coco,  val_trans,  val_acc,  val_thought,  val_table  = run_eval(raw_val,  "Val")
+    test_loss, test_coco, test_trans, test_acc, test_thought, test_table = run_eval(raw_test, "Test")
+
+    wandb.log({
+        "eval/val_loss":              val_loss,
+        "eval/val_coconut_loss":      val_coco,
+        "eval/val_translator_loss":   val_trans,
+        "eval/val_samples_table":     val_table,
+        "eval/val_answer_accuracy":   val_acc,
+        "eval/val_thought_accuracy":  val_thought,
+        "eval/test_loss":             test_loss,
+        "eval/test_coconut_loss":     test_coco,
+        "eval/test_translator_loss":  test_trans,
+        "eval/test_samples_table":    test_table,
+        "eval/test_answer_accuracy":  test_acc,
+        "eval/test_thought_accuracy": test_thought,
+        "meta/stage":                 stage,
+        "meta/epoch":                 epoch,
+    })
+
+    model.train()
+    return val_acc, test_acc
+
+
+def train_one_prob(uniform_prob, cfg, device):
+    run_name = f"uniform_prob_{uniform_prob:.1f}".replace(".", "p")
+    save_dir  = os.path.join(cfg["save_base_path"], run_name)
+
+    print(f"\n{'='*60}")
+    print(f"Training: uniform_prob = {uniform_prob}  (run: {run_name})")
+    print(f"{'='*60}")
+
+    # 固定随机种子（保证单一变量）
+    random.seed(GLOBAL_SEED)
+    np.random.seed(GLOBAL_SEED)
+    torch.manual_seed(GLOBAL_SEED)
+    torch.cuda.manual_seed_all(GLOBAL_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+    # ---- Tokenizer（与 train.py 完全一致）----
+    tokenizer = AutoTokenizer.from_pretrained(cfg["model_id"])
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+
     special_tokens = ["<latent>", "<|start-latent|>", "<|end-latent|>"]
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+
     latent_id = tokenizer.convert_tokens_to_ids("<latent>")
     start_id  = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id    = tokenizer.convert_tokens_to_ids("<|end-latent|>")
-    return tokenizer, latent_id, start_id, end_id
+    pad_id    = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
+    run_cfg = {**cfg, "uniform_prob": uniform_prob, "name": run_name}
 
-def build_model(cfg, tokenizer, latent_id, start_id, end_id, device):
-    vocab_size = len(tokenizer)
-    pad_id = tokenizer.pad_token_id
-
+    # ---- Base Model（与 train.py 完全一致）----
     base_model = GPT2LMHeadModel.from_pretrained(cfg["model_id"])
+    vocab_size  = len(tokenizer)
 
     if cfg.get("load_model_path"):
-        ckpt = torch.load(cfg["load_model_path"], map_location="cpu")
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        clean = {k.replace("base_causallm.", ""): v for k, v in state_dict.items()}
-        ckpt_vocab = clean["transformer.wte.weight"].size(0)
-        base_model.resize_token_embeddings(ckpt_vocab)
-        clean = {k: v for k, v in clean.items()
-                 if not k.startswith("embedding.")}
-        base_model.load_state_dict(clean, strict=False)
-        if ckpt_vocab != vocab_size:
-            base_model.resize_token_embeddings(vocab_size)
+        coconut_ckpt    = torch.load(cfg["load_model_path"], map_location="cpu")
+        state_dict      = coconut_ckpt.get("model_state_dict", coconut_ckpt)
+        new_state_dict  = {k.replace("base_causallm.", ""): v for k, v in state_dict.items()}
+        ckpt_vocab_size = new_state_dict["transformer.wte.weight"].size(0)
+        base_model.resize_token_embeddings(ckpt_vocab_size)
+        final_state_dict = {k: v for k, v in new_state_dict.items()
+                            if k != "embedding.weight" and not k.startswith("embedding.")}
+        base_model.load_state_dict(final_state_dict, strict=False)
+        actual_vocab_size = len(tokenizer)
+        if ckpt_vocab_size != actual_vocab_size:
+            base_model.resize_token_embeddings(actual_vocab_size)
+        vocab_size = actual_vocab_size
     else:
         base_model.resize_token_embeddings(vocab_size)
 
+    # ---- Translator（与 train.py 完全一致）----
     translator = CoconutTranslator(
         hidden_size=base_model.config.n_embd,
         vocab_size=vocab_size,
@@ -138,13 +280,14 @@ def build_model(cfg, tokenizer, latent_id, start_id, end_id, device):
     )
 
     if cfg.get("load_translator_path"):
-        t_ckpt = torch.load(cfg["load_translator_path"], map_location="cpu")
-        t_sd = t_ckpt.get("model_state_dict", t_ckpt)
-        t_clean = {k.replace("decoder.", ""): v for k, v in t_sd.items()
-                   if not k.startswith("embedding.")}
+        t_ckpt  = torch.load(cfg["load_translator_path"], map_location="cpu")
+        t_state = t_ckpt.get("model_state_dict", t_ckpt)
+        t_final = {k.replace("decoder.", ""): v for k, v in t_state.items()
+                   if k != "embedding.weight" and not k.startswith("embedding.")}
         translator.decoder.resize_token_embeddings(vocab_size)
-        translator.decoder.load_state_dict(t_clean, strict=False)
+        translator.decoder.load_state_dict(t_final, strict=False)
 
+    # ---- 组装模型（与 train.py 完全一致：只 .to(device)，不转 bf16）----
     model = CoconutWithTranslator(
         base_causallm=base_model,
         translator=translator,
@@ -154,251 +297,82 @@ def build_model(cfg, tokenizer, latent_id, start_id, end_id, device):
         eos_token_id=tokenizer.eos_token_id,
         lambda_translator=cfg.get("lambda_translator", 0.5),
         c_thought=cfg.get("c_thought", 1),
-    )
-    model.to(device).to(torch.bfloat16)
-    return model
+    ).to(device)
 
+    # ---- 数据集 ----
+    raw_train = get_dataset(cfg["train_path"], tokenizer)
+    raw_val   = get_dataset(cfg["val_path"],   tokenizer)
+    raw_test  = get_dataset(cfg["test_path"],  tokenizer)
 
-def build_optimizer(model, cfg, translator_lr):
-    return AdamW([
-        {"params": list(model.base_causallm.parameters()), "lr": cfg["lr"]},
-        {"params": list(model.translator.parameters()), "lr": translator_lr, "name": "translator"},
-    ], weight_decay=cfg["weight_decay"])
-
-
-def reset_stage(model, optimizer, cfg, translator_lr, warmup_steps):
-    """每个 stage 开始时：重置 translator Adam 状态，重置 LR，建新 scheduler。"""
-    translator_params = set(model.translator.parameters())
-    for p in translator_params:
-        if p in optimizer.state:
-            del optimizer.state[p]
-    for pg in optimizer.param_groups:
-        if pg.get("name") == "translator":
-            pg["lr"] = translator_lr
-        else:
-            pg["lr"] = cfg["lr"]
-    scheduler = LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps))
-    )
-    return scheduler
-
-
-@torch.no_grad()
-def compute_accuracy(model, tokenizer, raw_dataset, cfg_obj, latent_id, start_id, end_id,
-                     stage, device, num_samples, answers_gt):
-    """
-    在 raw_dataset 上运行生成评估，返回 (accuracy, thought_accuracy)。
-    raw_dataset: HuggingFace Dataset，已含 tokenized 字段。
-    answers_gt:  List[str]，按 idx 对应的 ground-truth 答案（已 strip & 去逗号）。
-    """
-    model.eval()
-    num_samples = min(num_samples, len(raw_dataset))
-    eval_ds = raw_dataset.select(range(num_samples))
-
-    gen_ds = get_question_latent_dataset(
-        scheduled_stage=stage,
-        base_dataset=eval_ds,
-        configs=cfg_obj,
-        start_id=start_id,
-        latent_id=latent_id,
-        end_id=end_id,
-    )
-
-    correct_answers, correct_thoughts, total_thoughts = 0, 0, 0
-    c_thought = cfg_obj.get("c_thought", 1)
-
-    for i in range(num_samples):
-        sample_gen = gen_ds[i]
-        raw_sample = eval_ds[i]
-        gt_answer = str(raw_sample["answer"]).replace(",", "").strip()
-        gt_steps  = raw_sample["steps"]
-        gt_thoughts = {k: v.strip() for k, v in enumerate(gt_steps[:stage])}
-
-        input_ids = torch.tensor(sample_gen["input_ids"]).unsqueeze(0).to(device)
-        first_latent_pos = (input_ids[0] == latent_id).nonzero()
-        first_pos = first_latent_pos[0, 0].item() if len(first_latent_pos) > 0 else input_ids.shape[1]
-        context_ids = input_ids[:, :first_pos]
-
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
-                labels=input_ids,
-                position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0).to(device),
-            )
-            decoded_thoughts_list = model.translate_latents(
-                outputs.latent_states, context_ids, tokenizer, c_thought=c_thought
-            )
-            gen_ids = model.generate(input_ids, tokenizer, max_new_tokens=150, show_thoughts=False)
-
-        answer_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True).strip()
-        pure_answer = answer_text.split("#")[-1].replace(",", "").strip()
-
-        if pure_answer == gt_answer:
-            correct_answers += 1
-
-        decoded_map = {k: t.strip() for k, t in enumerate(decoded_thoughts_list)}
-        for idx, gt_step in gt_thoughts.items():
-            clean_gt = gt_step.replace(" ", "").replace("\n", "").lower()
-            clean_dec = decoded_map.get(idx, "").replace(" ", "").replace("\n", "").lower()
-            if clean_gt == clean_dec:
-                correct_thoughts += 1
-            total_thoughts += 1
-
-    ans_acc     = correct_answers / num_samples
-    thought_acc = correct_thoughts / total_thoughts if total_thoughts > 0 else 0.0
-    return ans_acc, thought_acc
-
-
-@torch.no_grad()
-def compute_val_loss(model, raw_val, cfg, cfg_obj, latent_id, start_id, end_id,
-                     stage, device, tokenizer):
-    """计算 validation loss（使用完整 CoT+latent 序列，禁用 uniform_prob）。"""
-    num_eval = min(cfg["num_eval_samples"], len(raw_val))
-    eval_raw = raw_val.select(range(num_eval))
-
-    # uniform_prob=0 保证 eval loss 可复现
-    eval_cfg = make_cfg_obj({**cfg, "uniform_prob": 0.0})
-    eval_ds = get_cot_latent_dataset(
-        scheduled_stage=stage,
-        base_dataset=eval_raw,
-        configs=eval_cfg,
-        start_id=start_id,
-        latent_id=latent_id,
-        end_id=end_id,
-        shuffle=False,
-        eos_id=tokenizer.eos_token_id,
-    )
-    collator = MyCollator(tokenizer=tokenizer, latent_id=latent_id)
-    loader   = DataLoader(eval_ds, batch_size=cfg["batch_size_training"], collate_fn=collator)
-
-    total_loss, total_coco, total_trans = 0.0, 0.0, 0.0
-    for batch in loader:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(**batch)
-        total_loss  += out.loss.item()
-        total_coco  += out.coconut_loss.item()
-        total_trans += out.translator_loss.item()
-
-    n = len(loader)
-    return total_loss / n, total_coco / n, total_trans / n
-
-
-def save_best_checkpoint(model, optimizer, stage, epoch, save_dir, run_name):
-    os.makedirs(save_dir, exist_ok=True)
-    path = os.path.join(save_dir, f"{run_name}_best.pt")
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "stage": stage,
-        "epoch": epoch,
-    }, path)
-    print(f"  [Checkpoint] Saved best checkpoint → {path}")
-
-
-# -----------------------------------------------------------------------
-# 单次 uniform_prob 训练
-# -----------------------------------------------------------------------
-
-def train_one_prob(uniform_prob, cfg, raw_train, raw_val, raw_test,
-                   answers_val, answers_test, device, start_stage=1):
-
-    run_name = f"uniform_prob_{uniform_prob:.1f}".replace(".", "p")
-    save_dir = os.path.join(cfg["save_base_path"], run_name)
-
-    print(f"\n{'='*60}")
-    print(f"Training: uniform_prob = {uniform_prob}  (run: {run_name})")
-    print(f"{'='*60}")
-
-    # 每个 run 使用相同种子，确保 model 初始化、数据 shuffle 顺序一致，只有 uniform_prob 不同
-    seed = cfg.get("seed", GLOBAL_SEED)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
-    print(f"  Random seed fixed to {seed}")
-
-    # 每次从头构建 tokenizer / model
-    tokenizer, latent_id, start_id, end_id = build_tokenizer_and_ids(cfg["model_id"])
-
-    run_cfg = {**cfg, "uniform_prob": uniform_prob, "name": run_name}
-    model = build_model(run_cfg, tokenizer, latent_id, start_id, end_id, device)
-
-    translator_lr = cfg["translator_lr"]
-    optimizer = build_optimizer(model, cfg, translator_lr)
-
-    # 评估时的 cfg 对象（uniform_prob 对 eval 无影响，只影响训练集采样）
-    eval_cfg_obj = make_cfg_obj({**run_cfg, "uniform_prob": 0.0})
+    # ---- 优化器（与 train.py 完全一致：单一参数组）----
+    optimizer = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
 
     wandb.init(
         project=cfg["project"],
         name=run_name,
-        config={**run_cfg, "uniform_prob": uniform_prob},
+        config=run_cfg,
         reinit=True,
     )
 
-    global_step = 0
+    global_step   = 0
     best_test_acc = -1.0
-    num_eval = cfg["num_eval_samples"]
-    patience     = cfg.get("early_stopping_patience", 3)
-    min_epochs   = cfg.get("early_stopping_min_epochs", 2)
+    patience      = cfg.get("early_stopping_patience", 8)
+    min_epochs    = cfg.get("early_stopping_min_epochs", 5)
+    warmup_steps  = cfg.get("warmup_steps_per_stage", 100)
 
-    for stage in range(start_stage, cfg["max_latent_stage"] + 1):
+    for stage in range(1, cfg["max_latent_stage"] + 1):
         print(f"\n>>> Stage {stage}  (uniform_prob={uniform_prob})")
 
-        # 动态 lambda_translator
-        current_lambda = cfg["lambda_translator"] * (stage / cfg["max_latent_stage"])
+        # 动态 lambda_translator（与 train.py 完全一致）
+        current_lambda = cfg.get("lambda_translator", 0.5) * (stage / cfg["max_latent_stage"])
         model.lambda_translator = current_lambda
+        print(f"  lambda_translator = {current_lambda:.3f}")
 
-        scheduler = reset_stage(model, optimizer, cfg, translator_lr,
-                                 cfg["warmup_steps_per_stage"])
-
-        # early stopping 计数器（仅最后 stage 有效，进入新 stage 时重置）
-        stage_best_test_acc = -1.0
-        stage_no_improve    = 0
-        is_final_stage      = (stage == cfg["max_latent_stage"])
+        # Stage 开始时重置 LR + warmup scheduler（与 train.py 完全一致）
+        for pg in optimizer.param_groups:
+            pg["lr"] = cfg["lr"]
+        scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps)),
+        )
 
         target_epochs = (cfg["epochs_for_final_stage"]
                          if stage == cfg["max_latent_stage"]
                          else cfg["epochs_per_stage"])
 
-        train_cfg_obj = make_cfg_obj(run_cfg)
         train_ds = get_cot_latent_dataset(
             scheduled_stage=stage,
             base_dataset=raw_train,
-            configs=train_cfg_obj,
+            configs=type('obj', (object,), run_cfg),
             start_id=start_id,
             latent_id=latent_id,
             end_id=end_id,
             shuffle=True,
             eos_id=tokenizer.eos_token_id,
         )
-        collator    = MyCollator(tokenizer=tokenizer, latent_id=latent_id)
-        # generator 固定每个 stage 的 shuffle 顺序（seed + stage 组合保证 stage 间顺序不同但跨 run 一致）
-        g = torch.Generator()
-        g.manual_seed(seed + stage)
+        collator     = MyCollator(tokenizer=tokenizer, latent_id=latent_id)
         train_loader = DataLoader(
             train_ds,
             batch_size=cfg["batch_size_training"],
             shuffle=True,
             collate_fn=collator,
-            generator=g,
         )
 
+        is_final_stage   = (stage == cfg["max_latent_stage"])
+        stage_best_test  = -1.0
+        stage_no_improve = 0
+
         for epoch in range(target_epochs):
-            # ---------- 训练 ----------
+            # ---- 训练（与 train.py 完全一致）----
             model.train()
             pbar = tqdm(train_loader,
                         desc=f"[prob={uniform_prob}] Stage {stage} Epoch {epoch}/{target_epochs-1}")
+
             for batch in pbar:
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                          for k, v in batch.items()}
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = model(**batch)
+
+                outputs = model(**batch)
                 loss = outputs.loss / cfg["gradient_accumulation_steps"]
                 loss.backward()
 
@@ -410,110 +384,70 @@ def train_one_prob(uniform_prob, cfg, raw_train, raw_val, raw_test,
 
                 if global_step % 10 == 0:
                     wandb.log({
-                        "train/total_loss":        outputs.loss.item(),
-                        "train/coconut_loss":      outputs.coconut_loss.item(),
-                        "train/translator_loss":   outputs.translator_loss.item(),
-                        "meta/stage":              stage,
-                        "meta/epoch":              epoch,
-                        "meta/step":               global_step,
-                        "meta/lr":                 optimizer.param_groups[0]["lr"],
-                        "meta/lambda_translator":  model.lambda_translator,
+                        "train/total_loss":       outputs.loss.item(),
+                        "train/coconut_loss":     outputs.coconut_loss.item(),
+                        "train/translator_loss":  outputs.translator_loss.item(),
+                        "meta/stage":             stage,
+                        "meta/epoch":             epoch,
+                        "meta/step":              global_step,
+                        "meta/lr":                optimizer.param_groups[0]["lr"],
+                        "meta/lambda_translator": model.lambda_translator,
                     })
+
                 pbar.set_postfix({"loss": f"{outputs.loss.item():.4f}"})
                 global_step += 1
 
-            # ---------- 验证 loss ----------
-            print(f"\n  [Eval] Stage {stage} Epoch {epoch} — computing val loss ...")
-            val_loss, val_coco, val_trans = compute_val_loss(
-                model, raw_val, cfg, eval_cfg_obj, latent_id, start_id, end_id,
-                stage, device, tokenizer
-            )
-            print(f"  val_loss={val_loss:.4f}  (coconut={val_coco:.4f}  translator={val_trans:.4f})")
-
-            # ---------- Val accuracy ----------
-            print(f"  [Eval] Stage {stage} Epoch {epoch} — val accuracy ...")
-            val_acc, val_thought_acc = compute_accuracy(
-                model, tokenizer, raw_val, eval_cfg_obj,
+            # ---- 评估（val + test）----
+            print(f"\nRunning Evaluation for Stage {stage}, Epoch {epoch}...")
+            val_acc, test_acc = evaluate_and_log(
+                model, raw_val, raw_test, tokenizer,
+                stage, epoch, device, run_cfg,
                 latent_id, start_id, end_id,
-                stage, device, num_eval, answers_val
             )
-            print(f"  val_acc={val_acc*100:.2f}%  thought_acc={val_thought_acc*100:.2f}%")
 
-            # ---------- Test accuracy ----------
-            print(f"  [Eval] Stage {stage} Epoch {epoch} — test accuracy ...")
-            test_acc, test_thought_acc = compute_accuracy(
-                model, tokenizer, raw_test, eval_cfg_obj,
-                latent_id, start_id, end_id,
-                stage, device, num_eval, answers_test
-            )
-            print(f"  test_acc={test_acc*100:.2f}%  test_thought_acc={test_thought_acc*100:.2f}%")
-
-            # ---------- 上传 wandb ----------
-            wandb.log({
-                "eval/val_loss":              val_loss,
-                "eval/val_coconut_loss":      val_coco,
-                "eval/val_translator_loss":   val_trans,
-                "eval/val_answer_accuracy":   val_acc,
-                "eval/val_thought_accuracy":  val_thought_acc,
-                "eval/test_answer_accuracy":  test_acc,
-                "eval/test_thought_accuracy": test_thought_acc,
-                "meta/stage":                 stage,
-                "meta/epoch":                 epoch,
-            })
-
-            # ---------- 只保存全局 test 最优 checkpoint ----------
+            # ---- 只保存 test acc 最高的 checkpoint ----
             if test_acc > best_test_acc:
                 best_test_acc = test_acc
-                save_best_checkpoint(model, optimizer, stage, epoch, save_dir, run_name)
+                save_checkpoint(model, optimizer, stage, epoch, save_dir, run_name)
                 wandb.log({"eval/best_test_accuracy": best_test_acc,
                            "meta/stage": stage, "meta/epoch": epoch})
                 print(f"  *** New best test acc: {best_test_acc*100:.2f}% ***")
 
-            # ---------- Per-stage early stopping ----------
-            if test_acc > stage_best_test_acc:
-                stage_best_test_acc = test_acc
-                stage_no_improve    = 0
+            # ---- Early stopping（仅最后 stage，至少跑 min_epochs）----
+            if test_acc > stage_best_test:
+                stage_best_test  = test_acc
+                stage_no_improve = 0
             else:
                 stage_no_improve += 1
 
-            # Early stopping 仅在最后 stage 触发
-            should_stop = (is_final_stage
-                           and stage_no_improve >= patience
-                           and epoch + 1 >= min_epochs)
             wandb.log({
                 "early_stopping/stage_no_improve": stage_no_improve,
-                "early_stopping/stage_best_test":  stage_best_test_acc,
+                "early_stopping/stage_best_test":  stage_best_test,
                 "meta/stage": stage, "meta/epoch": epoch,
             })
 
+            should_stop = (is_final_stage
+                           and stage_no_improve >= patience
+                           and epoch + 1 >= min_epochs)
             if should_stop:
-                print(f"  [Early Stop] Final stage {stage} stopped at epoch {epoch} "
-                      f"({stage_no_improve} epochs without improvement, "
-                      f"best={stage_best_test_acc*100:.2f}%)")
+                print(f"  [Early Stop] Stage {stage} stopped at epoch {epoch} "
+                      f"({stage_no_improve} epochs no improvement, "
+                      f"best={stage_best_test*100:.2f}%)")
                 wandb.log({"early_stopping/triggered_stage": stage,
                            "early_stopping/triggered_epoch": epoch,
                            "meta/stage": stage, "meta/epoch": epoch})
-                break   # 结束训练
+                break
 
     wandb.finish()
     print(f"\n[Done] uniform_prob={uniform_prob}  best_test_acc={best_test_acc*100:.2f}%")
     return best_test_acc
 
 
-# -----------------------------------------------------------------------
-# 主函数
-# -----------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--probs", nargs="+", type=float, default=UNIFORM_PROBS,
-                        help="要扫描的 uniform_prob 值列表")
-    parser.add_argument("--start_stage", type=int, default=1,
-                        help="从第几个 stage 开始训练（续训时用）")
-    parser.add_argument("--patience", type=int, default=None,
-                        help="Early stopping patience（覆盖 BASE_CFG 默认值）")
-    parser.add_argument("--min_epochs", type=int, default=None,
-                        help="每 stage 最少跑多少 epoch 才允许 early stop（覆盖 BASE_CFG）")
+    parser.add_argument("--probs", nargs="+", type=float, default=UNIFORM_PROBS)
+    parser.add_argument("--patience",   type=int, default=None)
+    parser.add_argument("--min_epochs", type=int, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -521,39 +455,14 @@ def main():
     print(f"uniform_prob sweep: {args.probs}")
 
     cfg = BASE_CFG.copy()
-    if args.patience is not None:
-        cfg["early_stopping_patience"] = args.patience
+    if args.patience   is not None:
+        cfg["early_stopping_patience"]  = args.patience
     if args.min_epochs is not None:
         cfg["early_stopping_min_epochs"] = args.min_epochs
 
-    # 预加载数据集（tokenizer 只用来 tokenize，不同 prob 共享同一份数据）
-    print("\nLoading datasets ...")
-    tokenizer, _, _, _ = build_tokenizer_and_ids(cfg["model_id"])
-    raw_train = get_dataset(cfg["train_path"], tokenizer)
-    raw_val   = get_dataset(cfg["val_path"],   tokenizer)
-    raw_test  = get_dataset(cfg["test_path"],  tokenizer)
-
-    # ground-truth 答案（按顺序，idx 对应 raw_* 中的位置）
-    def load_answers(path):
-        data = json.load(open(path))
-        return [d["answer"].replace(",", "").strip() for d in data]
-
-    answers_val  = load_answers(cfg["val_path"])
-    answers_test = load_answers(cfg["test_path"])
-
     summary = {}
     for prob in args.probs:
-        best_acc = train_one_prob(
-            uniform_prob=prob,
-            cfg=cfg,
-            raw_train=raw_train,
-            raw_val=raw_val,
-            raw_test=raw_test,
-            answers_val=answers_val,
-            answers_test=answers_test,
-            device=device,
-            start_stage=args.start_stage,
-        )
+        best_acc = train_one_prob(prob, cfg, device)
         summary[prob] = best_acc
 
     print("\n" + "="*50)
@@ -562,11 +471,11 @@ def main():
         print(f"  uniform_prob={prob:.1f}  →  {acc*100:.2f}%")
     print("="*50)
 
-    # 保存 summary
     os.makedirs(cfg["save_base_path"], exist_ok=True)
-    with open(os.path.join(cfg["save_base_path"], "sweep_summary.json"), "w") as f:
+    out_path = os.path.join(cfg["save_base_path"], "sweep_summary.json")
+    with open(out_path, "w") as f:
         json.dump({str(k): v for k, v in summary.items()}, f, indent=2)
-    print(f"Summary saved to {cfg['save_base_path']}/sweep_summary.json")
+    print(f"Summary saved to {out_path}")
 
 
 if __name__ == "__main__":

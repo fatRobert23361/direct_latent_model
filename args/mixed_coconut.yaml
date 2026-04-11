@@ -32,9 +32,9 @@ load_model_path: /home/haoyang/haoyang/coconut/models/nihaoyang2002-kth-royal-in
 load_translator_path: null
 
 # 恢复训练相关参数
-resume_from_checkpoint: /home/haoyang/haoyang/coconut/models/prosqa-coconut-hybrid_v7/prosqa-coconut-hybrid-v7-resume_stage6_epoch3.pt
-resume_stage: 6
-resume_epoch: 3
+resume_from_checkpoint: null
+resume_stage: 1
+resume_epoch: 0
 
 # 如果你只想单独给最后一个 stage 加训，覆盖默认的 epochs_per_stage：
 # (如果不需要覆盖，可以不填或填与 epochs_per_stage 相同的值)
