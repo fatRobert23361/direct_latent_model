@@ -1,16 +1,17 @@
 """
 eval_latent_replacement_hybrid.py
 
-测试混合模型 (CoconutWithTranslator) 中将第一个 latent token 的 embedding
-替换为其他数据的 latent 或随机向量后，对推理准确率的影响。
+测试混合模型 (CoconutWithTranslator) 中依次将第 1～6 个 latent token 的 hidden state
+替换为随机向量或其他样本的 latent 后，对推理准确率的影响。
 
 对应纯 Coconut 版本：eval_latent_replacement.py
 
 用法:
     python eval_latent_replacement_hybrid.py \
-        --checkpoint models/prosqa-coconut-hybrid_v5/prosqa-coconut-hybrid-v5_stage6_epoch7.pt \
+        --checkpoint models/uniform_sweep/uniform_prob_0p0/uniform_prob_0p0_best.pt \
         --val_path data/prosqa_test.json \
-        --stage 6
+        --stage 6 \
+        --c_thought 2
 """
 
 import argparse
@@ -50,7 +51,6 @@ def build_config(val_path, stage, c_thought=1):
 
 # ------------------------------------------------------------------
 # 模型加载
-# 注意：混合模型的 token 顺序为 <latent>(50257), <|start-latent|>(50258), <|end-latent|>(50259)
 # ------------------------------------------------------------------
 
 def load_hybrid_model(checkpoint_path, device):
@@ -59,7 +59,6 @@ def load_hybrid_model(checkpoint_path, device):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # 混合模型的特殊 token 添加顺序与纯 Coconut 不同
     special_tokens = ["<latent>", "<|start-latent|>", "<|end-latent|>"]
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
 
@@ -93,7 +92,6 @@ def load_hybrid_model(checkpoint_path, device):
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    # 混合模型 checkpoint 格式: {"model_state_dict": ..., "optimizer_state_dict": ..., ...}
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     state_dict = ckpt.get("model_state_dict", ckpt)
 
@@ -109,21 +107,23 @@ def load_hybrid_model(checkpoint_path, device):
 
 
 # ------------------------------------------------------------------
-# 替换版 generate（复现 CoconutWithTranslator.forward 逻辑，在 pass_idx==0 时注入）
+# 替换版 generate（可指定替换哪个 pass 的 latent）
 # ------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_tokens=128):
+def generate_with_replaced_latent(model, input_ids, replacement_embed,
+                                   target_pass_idx=0, max_new_tokens=128):
     """
-    与 CoconutWithTranslator.generate() 等价，但在 pass_idx==0 时将
-    第一个 latent 位置的 hidden state 替换为 replacement_embed。
+    与 CoconutWithTranslator.generate() 等价，但在 pass_idx==target_pass_idx 时将
+    对应 latent 位置的 hidden state 替换为 replacement_embed。
 
     Args:
-        model:              CoconutWithTranslator 实例
-        input_ids:          shape (1, seq_len)，包含 <latent> 占位符
-        replacement_embed:  shape (hidden_size,)，用于替换第一个 latent
-                            传 None 则退化为正常 generate
-        max_new_tokens:     最大生成 token 数
+        model:             CoconutWithTranslator 实例
+        input_ids:         shape (1, seq_len)，包含 <latent> 占位符
+        replacement_embed: shape (hidden_size,)，用于替换目标 latent
+                           传 None 则退化为正常 generate（baseline）
+        target_pass_idx:   第几个 latent pass 被替换（0-indexed）
+        max_new_tokens:    最大生成 token 数
 
     Returns:
         all_tokens: List[int]，包含输入和生成的全部 token id
@@ -134,7 +134,6 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
     latent_indices = (input_ids == model.latent_token_id).nonzero()
 
     if len(latent_indices) == 0:
-        # 无 latent token：直接走正常 generate
         out = model.generate(input_ids=input_ids, tokenizer=None,
                              max_new_tokens=max_new_tokens, show_thoughts=False)
         return all_tokens + out[0].tolist()
@@ -152,7 +151,6 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
     next_compute_range = (0, latent_indices[:, 1].min().item())
     kv_cache = None
 
-    # ---- 多 pass 前向，逐个填充 latent 位置 ----
     for pass_idx in range(max_n_latents):
         if kv_cache is None:
             outputs = model.base_causallm(
@@ -194,8 +192,7 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
             batch_idx_t = torch.tensor([b for b, _ in filling_indices], device=device)
             token_idx_t = torch.tensor([t for _, t in filling_indices], device=device)
 
-            if pass_idx == 0 and replacement_embed is not None:
-                # 替换所有 batch 内的第一个 latent 为同一个 replacement
+            if pass_idx == target_pass_idx and replacement_embed is not None:
                 new_values = replacement_embed.to(device).unsqueeze(0).expand(len(filling_indices), -1)
             else:
                 new_values = torch.stack([
@@ -205,7 +202,7 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
 
             inputs_embeds = inputs_embeds.index_put((batch_idx_t, token_idx_t), new_values)
 
-    # ---- 最终 pass ----
+    # 最终 pass
     past_kv = (
         [(k[:, :, :next_compute_range[0], :], v[:, :, :next_compute_range[0], :])
          for k, v in kv_cache]
@@ -243,24 +240,24 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
 
 
 # ------------------------------------------------------------------
-# 收集第一个 latent 的 hidden state
+# 收集指定 pass 的 latent hidden state
 # ------------------------------------------------------------------
 
 @torch.no_grad()
-def collect_first_latents(model, dataloader, device):
+def collect_latents_at_pass(model, dataloader, device, target_pass_idx):
     """
     遍历 dataloader，对每个样本运行一次 forward，
-    收集第一个 latent 位置（pass_idx=0）的 hidden state。
+    收集 target_pass_idx 对应 latent 位置的 hidden state。
 
     Returns:
         latents: List[Tensor|None]，每个元素 shape (hidden_size,)
-        idxs:    List[int]，对应的样本 idx
+        idxs:    List[int]
     """
     latents = []
     idxs = []
 
     for batch in dataloader:
-        test_idx = batch["idx"][0].item()
+        test_idx      = batch["idx"][0].item()
         input_ids     = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         position_ids  = batch["position_ids"].to(device)
@@ -273,9 +270,10 @@ def collect_first_latents(model, dataloader, device):
             position_ids=position_ids,
         )
 
-        if outputs.latent_states and outputs.latent_states[0] is not None:
-            # latent_states[0]: (1, 1, hidden_size) for batch_size=1
-            latent_vec = outputs.latent_states[0][0, 0, :]  # (hidden_size,)
+        if (outputs.latent_states
+                and target_pass_idx < len(outputs.latent_states)
+                and outputs.latent_states[target_pass_idx] is not None):
+            latent_vec = outputs.latent_states[target_pass_idx][0, 0, :]  # (hidden_size,)
             latents.append(latent_vec)
         else:
             latents.append(None)
@@ -291,19 +289,19 @@ def collect_first_latents(model, dataloader, device):
 
 @torch.no_grad()
 def evaluate_mode(model, tokenizer, dataloader, answers_val, device,
-                  latent_pool=None, mode="baseline"):
+                  target_pass_idx, latent_pool=None, mode="baseline"):
     """
     mode:
       "baseline" — 不替换，正常 generate
-      "random"   — 第一个 latent 替换为 N(0,1) 随机向量
-      "other"    — 第一个 latent 替换为另一条数据的 latent
+      "random"   — target_pass_idx 处替换为 N(0,1) 随机向量
+      "other"    — target_pass_idx 处替换为另一条数据的 latent
     """
     hidden_size = model.embedding.embedding_dim
     correct, total = 0, 0
 
     for sample_i, batch in enumerate(dataloader):
-        test_idx = batch["idx"][0].item()
-        answer   = answers_val[test_idx]
+        test_idx  = batch["idx"][0].item()
+        answer    = answers_val[test_idx]
         input_ids = batch["input_ids"].to(device)
 
         if mode == "baseline":
@@ -322,7 +320,10 @@ def evaluate_mode(model, tokenizer, dataloader, answers_val, device,
             raise ValueError(f"Unknown mode: {mode}")
 
         tokens = generate_with_replaced_latent(
-            model, input_ids, replacement_embed=replacement, max_new_tokens=128
+            model, input_ids,
+            replacement_embed=replacement,
+            target_pass_idx=target_pass_idx,
+            max_new_tokens=128,
         )
 
         text_output   = tokenizer.decode(tokens, skip_special_tokens=True)
@@ -342,22 +343,34 @@ def evaluate_mode(model, tokenizer, dataloader, answers_val, device,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint",
-                        default="models/prosqa-coconut-hybrid_v5/prosqa-coconut-hybrid-v5_stage6_epoch7.pt")
+                        default="models/uniform_sweep/uniform_prob_0p0/uniform_prob_0p0_best.pt")
     parser.add_argument("--val_path",    default="data/prosqa_test.json")
     parser.add_argument("--stage",       type=int, default=6,
-                        help="评估时使用的 latent stage 数")
+                        help="评估时使用的 latent stage 数（同时也是替换实验的 latent 总数）")
     parser.add_argument("--c_thought",   type=int, default=1)
-    parser.add_argument("--output_json", default="results/latent_replacement_hybrid.json")
+    parser.add_argument("--output_json", default=None,
+                        help="结果保存路径；默认放在 checkpoint 同级目录下")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed",        type=int, default=42)
     args = parser.parse_args()
 
+    # 默认输出路径
+    if args.output_json is None:
+        args.output_json = os.path.join(
+            os.path.dirname(args.checkpoint),
+            "latent_replacement_results.json"
+        )
+
+    out_dir = os.path.dirname(args.output_json)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
     device = torch.device(args.device)
     print(f"Device: {device}")
+    print(f"Checkpoint: {args.checkpoint}")
 
     print("Loading hybrid model ...")
     model, tokenizer, latent_id, start_id, end_id = load_hybrid_model(args.checkpoint, device)
@@ -381,52 +394,72 @@ def main():
         no_special_marker=False,
     )
 
-    # mixed_dataset 保留了 answer/steps 字符串列，collator 无法将其转为 tensor，需提前移除
     for col in ["answer", "steps"]:
         if col in dataset.column_names:
             dataset = dataset.remove_columns(col)
 
-    collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+    collator = MyCollator(tokenizer=tokenizer, latent_id=latent_id, label_pad_token_id=-100)
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=1, shuffle=False, num_workers=2, collate_fn=collator
     )
 
-    # ---- Step 1: 收集所有样本的第一个 latent hidden state ----
-    print(f"\nCollecting first-latent hidden states (stage={args.stage}) ...")
-    latent_pool, sample_idxs = collect_first_latents(model, dataloader, device)
-    valid_count = sum(1 for v in latent_pool if v is not None)
-    print(f"  Collected {valid_count}/{len(latent_pool)} valid latents")
+    # ---- 依次对第 1～stage 个 latent 做替换实验 ----
+    all_results = {}
 
-    # ---- Step 2: 三种模式评估 ----
-    results = {}
-    for mode in ("baseline", "random", "other"):
-        print(f"\n--- Mode: {mode} ---")
-        acc, correct, total = evaluate_mode(
-            model, tokenizer, dataloader, answers_val, device,
-            latent_pool=latent_pool, mode=mode,
-        )
-        results[mode] = {"accuracy": acc, "correct": correct, "total": total}
-        print(f"  {correct}/{total} = {acc * 100:.2f}%")
+    for target_pass_idx in range(args.stage):
+        latent_label = f"latent_{target_pass_idx + 1}"  # 1-indexed 方便阅读
+        print(f"\n{'='*60}")
+        print(f"Replacing latent #{target_pass_idx + 1}  (pass_idx={target_pass_idx})")
+        print(f"{'='*60}")
+
+        # 收集当前 pass 的 latent hidden states（用于 other 模式）
+        print(f"  Collecting hidden states at pass {target_pass_idx} ...")
+        latent_pool, _ = collect_latents_at_pass(model, dataloader, device, target_pass_idx)
+        valid = sum(1 for v in latent_pool if v is not None)
+        print(f"  Collected {valid}/{len(latent_pool)} valid latents")
+
+        pass_results = {}
+        for mode in ("baseline", "random", "other"):
+            print(f"\n  Mode: {mode}")
+            acc, correct, total = evaluate_mode(
+                model, tokenizer, dataloader, answers_val, device,
+                target_pass_idx=target_pass_idx,
+                latent_pool=latent_pool,
+                mode=mode,
+            )
+            pass_results[mode] = {"accuracy": acc, "correct": correct, "total": total}
+            print(f"  {correct}/{total} = {acc * 100:.2f}%")
+
+        all_results[latent_label] = pass_results
+
+        baseline_acc = pass_results["baseline"]["accuracy"]
+        for mode in ("random", "other"):
+            drop = (baseline_acc - pass_results[mode]["accuracy"]) * 100
+            print(f"  Accuracy drop ({mode} vs baseline): {drop:+.2f}pp")
 
     # ---- 保存结果 ----
     output = {
         "checkpoint": args.checkpoint,
-        "stage": args.stage,
-        "c_thought": args.c_thought,
-        "results": results,
+        "stage":      args.stage,
+        "c_thought":  args.c_thought,
+        "results":    all_results,
     }
     with open(args.output_json, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nResults saved to {args.output_json}")
 
+    # ---- 汇总打印 ----
     print("\n=== Summary ===")
-    for mode, r in results.items():
-        print(f"  {mode:10s}: {r['accuracy'] * 100:.2f}%  ({r['correct']}/{r['total']})")
-
-    baseline_acc = results["baseline"]["accuracy"]
-    for mode in ("random", "other"):
-        drop = (baseline_acc - results[mode]["accuracy"]) * 100
-        print(f"  Accuracy drop ({mode} vs baseline): {drop:+.2f}pp")
+    print(f"{'Latent':>10}  {'baseline':>10}  {'random':>10}  {'other':>10}  "
+          f"{'drop(rand)':>12}  {'drop(other)':>12}")
+    for label, res in all_results.items():
+        b  = res["baseline"]["accuracy"] * 100
+        r  = res["random"]["accuracy"]   * 100
+        o  = res["other"]["accuracy"]    * 100
+        dr = b - r
+        do = b - o
+        print(f"{label:>10}  {b:>9.2f}%  {r:>9.2f}%  {o:>9.2f}%  "
+              f"{dr:>+11.2f}pp  {do:>+11.2f}pp")
 
 
 if __name__ == "__main__":
