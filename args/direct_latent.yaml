@@ -17,8 +17,18 @@ lr: !!float "1e-4"
 weight_decay: 0.01
 batch_size_training: 8
 gradient_accumulation_steps: 4
-num_epochs: 50
+num_epochs: 60
 warmup_steps: 100
+
+# COT 遮蔽调度（方案 B）
+# p_mask 从 p_mask_start 线性升至 p_mask_end
+#   p_mask=0 → 所有样本含完整 COT（最丰富监督）
+#   p_mask=1 → 所有样本不含 COT（与推理格式一致）
+# p_mask_warmup_epochs：前 N 个 epoch 固定在 p_mask_start
+p_mask_start:         0.0
+p_mask_end:           1.0
+p_mask_warmup_epochs: 5    # 前 5 epoch 用纯 COT 监督热身
+p_mask_ramp_end_epoch: 49  # p_mask 在 epoch 49 达到 1.0（之后保持不变）
 
 # 评估
 num_eval_samples: 300
@@ -26,7 +36,10 @@ max_new_tokens_eval: 150
 n_translations_upload: 100   # 每个 epoch 上传到 wandb 的 test 翻译条数
 
 # 权重加载 / 断点续训
-resume_from_checkpoint: null
+resume_from_checkpoint: ./models/direct_latent/direct_latent_prosqa_best.pt
+
+# 随机种子
+seed: 42
 
 # 调试（true 时关闭 wandb 和 checkpoint 保存）
 debug: false
