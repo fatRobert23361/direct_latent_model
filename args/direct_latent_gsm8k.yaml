@@ -1,0 +1,46 @@
+project: coconut-direct-latent
+save_path: ./models/direct_latent_gsm8k_v2
+name: direct_latent_gsm8k_v2
+
+# 模型参数
+model_id: openai-community/gpt2
+n_latent: 6              # 与 prosqa 保持一致；latent 太多反而稀疏，主要靠调度解决
+lambda_translator: 0.8   # 提高权重，迫使 backbone 把推理信息编码进 latent
+
+# 数据路径
+train_path: data/gsm_train.json
+val_path:   data/gsm_valid.json
+test_path:  data/gsm_test.json
+
+# 训练超参
+lr: !!float "1e-4"
+weight_decay: 0.01
+batch_size_training: 16
+gradient_accumulation_steps: 2
+num_epochs: 100
+warmup_steps: 200        # GSM8K 训练集更大，warmup 步数适当增加
+
+# COT 遮蔽调度
+# GSM8K 推理链长且复杂，需要更长时间让 backbone 先学会依赖 COT
+# p_mask 调度比 prosqa 更保守：
+#   前 15 epoch 全程 COT（热身）
+#   epoch 15-85 线性从 0→1（70 epoch 的缓慢过渡）
+#   epoch 85+ 保持 p_mask=1（纯 latent，约 15 epoch 巩固）
+p_mask_start:          0.0
+p_mask_end:            1.0
+p_mask_warmup_epochs:  15   # prosqa 是 5；GSM8K 用 3 倍热身
+p_mask_ramp_end_epoch: 85   # prosqa 是 49/60；这里 85/100 更缓慢
+
+# 评估
+num_eval_samples: 300
+max_new_tokens_eval: 200    # GSM8K 答案含计算过程，比 prosqa 更长
+n_translations_upload: 100
+
+# 权重加载 / 断点续训
+resume_from_checkpoint: null
+
+# 随机种子
+seed: 42
+
+# 调试（true 时关闭 wandb 和 checkpoint 保存）
+debug: false

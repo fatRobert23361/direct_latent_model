@@ -1,0 +1,41 @@
+project: coconut-direct-latent
+save_path: ./models/direct_latent_no_trans_gsm8k
+name: direct_latent_no_trans_gsm8k
+
+# 模型参数
+model_id: openai-community/gpt2
+n_latent: 6
+use_translator: false        # baseline：无 translator，纯 coconut latent 训练
+
+# 数据路径
+train_path: data/gsm_train.json
+val_path:   data/gsm_valid.json
+test_path:  data/gsm_test.json
+
+# 训练超参（与 direct_latent_gsm8k.yaml 保持一致）
+lr: !!float "1e-4"
+weight_decay: 0.01
+batch_size_training: 16
+gradient_accumulation_steps: 2
+num_epochs: 100
+warmup_steps: 200
+
+# COT 遮蔽调度（与 direct_latent_gsm8k.yaml 保持一致）
+p_mask_start:          0.0
+p_mask_end:            1.0
+p_mask_warmup_epochs:  15
+p_mask_ramp_end_epoch: 85
+
+# 评估
+num_eval_samples: 300
+max_new_tokens_eval: 200
+n_translations_upload: 0     # 无 translator，不上传翻译
+
+# 权重加载 / 断点续训
+resume_from_checkpoint: null
+
+# 随机种子
+seed: 42
+
+# 调试
+debug: false

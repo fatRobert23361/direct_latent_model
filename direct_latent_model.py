@@ -19,12 +19,12 @@ class DirectLatentModel(nn.Module):
     def __init__(
         self,
         base_causallm,
-        translator,
-        n_latent,
         latent_token_id,
         start_latent_id,
         end_latent_id,
         eos_token_id,
+        n_latent=6,
+        translator=None,
         lambda_translator=0.5,
     ):
         super().__init__()
@@ -162,7 +162,7 @@ class DirectLatentModel(nn.Module):
         # 5. Translator Loss：全部 latent 向量 → 完整推理链文本
         translator_loss = torch.tensor(0.0, device=input_ids.device)
 
-        if translator_labels is not None:
+        if self.translator is not None and translator_labels is not None:
             active_indices = [
                 b for b in range(input_ids.shape[0]) if len(all_latent_vecs[b]) > 0
             ]
@@ -222,6 +222,8 @@ class DirectLatentModel(nn.Module):
     @torch.no_grad()
     def translate_latents(self, latent_states_list, context_ids, tokenizer):
         """将全部 latent 状态一次性翻译为完整推理链文本，返回单条字符串列表。"""
+        if self.translator is None:
+            return [""]
         valid_vecs = [v for v in latent_states_list if v is not None]
         if not valid_vecs:
             return []

@@ -261,13 +261,16 @@ def train(cfg_path):
     base_model.resize_token_embeddings(vocab_size)
 
     # ---- Translator ----
-    translator = CoconutTranslator(
-        hidden_size=base_model.config.n_embd,
-        vocab_size=vocab_size,
-        start_id=start_id, end_id=end_id,
-        pad_id=pad_id, eos_id=tokenizer.eos_token_id,
-        mode="context_latent",
-    )
+    use_translator = cfg.get("use_translator", True)
+    translator = None
+    if use_translator:
+        translator = CoconutTranslator(
+            hidden_size=base_model.config.n_embd,
+            vocab_size=vocab_size,
+            start_id=start_id, end_id=end_id,
+            pad_id=pad_id, eos_id=tokenizer.eos_token_id,
+            mode="context_latent",
+        )
 
     # ---- Model ----
     n_latent = cfg.get("n_latent", 6)
@@ -377,15 +380,17 @@ def train(cfg_path):
                 optimizer.zero_grad()
 
             if global_step % 10 == 0 and not debug:
-                wandb.log({
-                    "train/total_loss":      outputs.loss.item(),
-                    "train/coconut_loss":    outputs.coconut_loss.item(),
-                    "train/translator_loss": outputs.translator_loss.item(),
-                    "meta/epoch":            epoch,
-                    "meta/step":             global_step,
-                    "meta/lr":               optimizer.param_groups[0]["lr"],
-                    "meta/p_mask":           p_mask,
-                })
+                train_log = {
+                    "train/total_loss":   outputs.loss.item(),
+                    "train/coconut_loss": outputs.coconut_loss.item(),
+                    "meta/epoch":         epoch,
+                    "meta/step":          global_step,
+                    "meta/lr":            optimizer.param_groups[0]["lr"],
+                    "meta/p_mask":        p_mask,
+                }
+                if use_translator:
+                    train_log["train/translator_loss"] = outputs.translator_loss.item()
+                wandb.log(train_log)
 
             pbar.set_postfix({"loss": f"{outputs.loss.item():.4f}", "p_mask": f"{p_mask:.2f}"})
             global_step += 1
@@ -412,37 +417,43 @@ def train(cfg_path):
             collect_translations=not debug,
         )
 
-        print(
-            f"[Epoch {epoch}]  "
-            f"val_acc={val_acc*100:.2f}%  test_acc={test_acc*100:.2f}%  |  "
-            f"val_coconut={val_coconut_loss:.4f}  val_trans={val_trans_loss:.4f}  |  "
-            f"test_coconut={test_coconut_loss:.4f}  test_trans={test_trans_loss:.4f}  |  "
-            f"p_mask={p_mask:.3f}"
-        )
+        if use_translator:
+            print(
+                f"[Epoch {epoch}]  "
+                f"val_acc={val_acc*100:.2f}%  test_acc={test_acc*100:.2f}%  |  "
+                f"val_coconut={val_coconut_loss:.4f}  val_trans={val_trans_loss:.4f}  |  "
+                f"test_coconut={test_coconut_loss:.4f}  test_trans={test_trans_loss:.4f}  |  "
+                f"p_mask={p_mask:.3f}"
+            )
+        else:
+            print(
+                f"[Epoch {epoch}]  "
+                f"val_acc={val_acc*100:.2f}%  test_acc={test_acc*100:.2f}%  |  "
+                f"val_coconut={val_coconut_loss:.4f}  test_coconut={test_coconut_loss:.4f}  |  "
+                f"p_mask={p_mask:.3f}"
+            )
 
         if not debug:
             log_dict = {
-                "eval/val_answer_accuracy":   val_acc,
-                "eval/val_coconut_loss":      val_coconut_loss,
-                "eval/val_translator_loss":   val_trans_loss,
-                "eval/test_answer_accuracy":  test_acc,
-                "eval/test_coconut_loss":     test_coconut_loss,
-                "eval/test_translator_loss":  test_trans_loss,
-                "meta/epoch":                 epoch,
-                "meta/p_mask":                p_mask,
+                "eval/val_answer_accuracy":  val_acc,
+                "eval/val_coconut_loss":     val_coconut_loss,
+                "eval/test_answer_accuracy": test_acc,
+                "eval/test_coconut_loss":    test_coconut_loss,
+                "meta/epoch":                epoch,
+                "meta/p_mask":               p_mask,
             }
+            if use_translator:
+                log_dict["eval/val_translator_loss"]  = val_trans_loss
+                log_dict["eval/test_translator_loss"] = test_trans_loss
             if test_table is not None:
                 log_dict["eval/test_translations"] = test_table
             wandb.log(log_dict)
 
-        # ---- Best checkpoint（仅在 p_mask >= 1.0 即纯 latent 阶段保存）----
+        # ---- Best checkpoint（任意 p_mask 下均保存）----
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            if p_mask >= 1.0:
-                save_best_checkpoint(model, cfg["save_path"], cfg["name"], epoch, val_acc)
-                print(f"  → New best val {val_acc * 100:.2f}% — checkpoint saved.")
-            else:
-                print(f"  → New best val {val_acc * 100:.2f}% (p_mask={p_mask:.3f} < 1, skip save)")
+            save_best_checkpoint(model, cfg["save_path"], cfg["name"], epoch, val_acc)
+            print(f"  → New best val {val_acc * 100:.2f}% (p_mask={p_mask:.3f}) — checkpoint saved.")
 
     if not debug:
         wandb.finish()

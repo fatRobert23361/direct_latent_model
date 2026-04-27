@@ -1,6 +1,6 @@
 project: coconut-direct-latent
-save_path: ./models/direct_latent
-name: direct_latent_prosqa
+save_path: ./models/direct_latent_gsm
+name: direct_latent_gsm
 
 # 模型参数
 model_id: openai-community/gpt2
@@ -8,9 +8,9 @@ n_latent: 6              # 固定 latent token 数量，不随 stage 变化
 lambda_translator: 0.5   # translator loss 权重（无 stage 缩放）
 
 # 数据路径
-train_path: data/prosqa_train.json
-val_path: data/prosqa_valid.json
-test_path: data/prosqa_test.json
+train_path: data/gsm_train.json
+val_path: data/gsm_valid.json
+test_path: data/gsm_test.json
 
 # 训练超参
 lr: !!float "1e-4"
@@ -36,7 +36,7 @@ max_new_tokens_eval: 150
 n_translations_upload: 100   # 每个 epoch 上传到 wandb 的 test 翻译条数
 
 # 权重加载 / 断点续训
-resume_from_checkpoint: ./models/direct_latent/direct_latent_prosqa_best.pt
+resume_from_checkpoint: null  # 或指定 checkpoint 路径
 
 # 随机种子
 seed: 42
