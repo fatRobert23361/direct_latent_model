@@ -11,3 +11,4 @@ coconut_prosqa_gpt2_context_test/Miniconda3-latest-Linux-x86_64.sh
 doc/
 results/
 CLAUDE.md
+data/hotpot_*.json

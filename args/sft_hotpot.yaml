@@ -1,0 +1,30 @@
+# GPT-2 COT SFT on HotpotQA-COT
+
+project:   coconut-hotpot
+name:      cot
+
+model_id:  openai-community/gpt2
+
+train_path: data/hotpot_cot_train.json
+val_path:   data/hotpot_cot_valid.json
+test_path:  data/hotpot_cot_test.json
+
+# Training
+num_epochs:                  15
+batch_size_training:         16
+batch_size_eval:             8
+gradient_accumulation_steps: 2
+lr:                          !!float 2e-5
+weight_decay:                0.01
+warmup_steps:                200
+
+# Evaluation（使用完整 val/test 集）
+max_new_tokens_eval: 300
+n_samples_upload:    50
+
+# Checkpoint
+save_path: models/cot_hotpot
+
+seed:  42
+debug: false
+resume_from_checkpoint: ~
