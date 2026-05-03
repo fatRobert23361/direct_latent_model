@@ -122,12 +122,19 @@ class DirectLatentCollator:
         # 1. 按 p_mask 决定每条样本是否插入 COT
         #    插入点：prefix（question+bot+latents+eot）之后、answer 之前
         # ------------------------------------------------------------------
+        max_seq_len = 1024
         for f in features:
             if "cot_tokens" in f and random.random() >= self.p_mask:
                 # 插入 COT
                 cot  = f["cot_tokens"]
                 n_pre = f["n_prefix"]
-                answer_toks = f["input_ids"][n_pre:]   # 原始 answer 部分
+                answer_toks = f["input_ids"][n_pre:]
+
+                # 如果插入 COT 后超过 max_seq_len，裁剪 COT 尾部以保留 answer
+                max_cot_len = max_seq_len - n_pre - len(answer_toks)
+                if max_cot_len < 0:
+                    max_cot_len = 0
+                cot = cot[:max_cot_len]
 
                 f["input_ids"]      = f["input_ids"][:n_pre] + cot + answer_toks
                 f["labels"]         = [-100] * n_pre + cot + answer_toks

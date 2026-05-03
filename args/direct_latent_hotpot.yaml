@@ -1,0 +1,45 @@
+project: coconut-hotpot
+save_path: ./models/direct_latent_hotpot
+name: direct_latent
+
+# 模型参数
+model_id: openai-community/gpt2
+n_latent: 6
+use_translator: true
+lambda_translator: 0.8
+
+# 数据路径
+train_path: data/hotpot_cot_train.json
+val_path:   data/hotpot_cot_valid.json
+test_path:  data/hotpot_cot_test.json
+
+# 训练超参
+# HotpotQA question 平均 475 tokens，序列较长，batch 需缩小
+lr: !!float "1e-4"
+weight_decay: 0.01
+batch_size_training: 8
+gradient_accumulation_steps: 4    # 等效 batch_size=32
+num_epochs: 60
+warmup_steps: 200
+
+# COT 遮蔽调度
+# HotpotQA 需要多跳推理，复杂度与 GSM8K 相近，采用相同的保守调度
+p_mask_start:          0.0
+p_mask_end:            1.0
+p_mask_warmup_epochs:  10
+p_mask_ramp_end_epoch: 50         # epoch 50 达到 1.0，之后 10 epoch 巩固
+
+# 评估
+# HotpotQA 答案是短实体字符串，生成长度无需太长
+num_eval_samples: 5000          # val/test 各 4348 条，设大于此值即为全量评估
+max_new_tokens_eval: 300
+n_translations_upload: 100
+
+# 权重加载 / 断点续训
+resume_from_checkpoint: null
+
+# 随机种子
+seed: 42
+
+# 调试
+debug: false
