@@ -209,10 +209,19 @@ def evaluate_accuracy(model, raw_dataset, answers_list, tokenizer,
         input_ids = torch.tensor([prompt["input_ids"]],      dtype=torch.long).to(device)
         attn_mask = torch.tensor([prompt["attention_mask"]], dtype=torch.long).to(device)
 
+        max_new = min(
+            cfg.get("max_new_tokens_eval", 200),
+            1024 - input_ids.shape[1],
+        )
+        if max_new <= 0:
+            em_list.append(0)
+            f1_list.append(0.0)
+            continue
+
         gen_ids  = model.generate(
             input_ids,
             attention_mask=attn_mask,
-            max_new_tokens=cfg.get("max_new_tokens_eval", 200),
+            max_new_tokens=max_new,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
