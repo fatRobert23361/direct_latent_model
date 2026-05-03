@@ -147,19 +147,86 @@ def evaluate_loss(model, raw_dataset, tokenizer, n_latent, latent_id,
 
 
 @torch.no_grad()
+def batch_greedy_generate(model, input_ids, attention_mask, position_ids, device, max_new_tokens):
+    """批量贪心解码：一次处理多条样本，比逐条生成快 4-6x。
+
+    model.forward() 需要左侧 padding 来对齐 latent 位置。生成阶段：
+      1. 剥掉左侧 padding → 右侧 padding（mask=0）
+      2. 传显式 position_ids：生成 token 从各样本的 real_len 开始编号，
+         与 model.generate() 的行为完全一致
+      3. 限制生成步数，避免超过 GPT-2 的 1024 位置编码上限
+    """
+    dummy_labels = input_ids.clone()
+    fwd = model.forward(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=dummy_labels,
+        position_ids=position_ids,
+    )
+
+    B, L, H = fwd.inputs_embeds.shape
+    n_pads    = (attention_mask == 0).sum(dim=1)            # (B,) 左侧 padding 数
+    real_lens = (L - n_pads).to(torch.long)                 # (B,) 各样本真实长度
+    max_real  = int(real_lens.max().item())
+
+    # 剥掉左侧 padding，右侧补零对齐（mask=0，保证不被 attend）
+    curr_embeds = fwd.inputs_embeds.new_zeros(B, max_real, H)
+    curr_mask   = torch.zeros(B, max_real, dtype=torch.long, device=device)
+    curr_pos    = torch.zeros(B, max_real, dtype=torch.long, device=device)
+    for i in range(B):
+        n = int(n_pads[i].item())
+        r = int(real_lens[i].item())
+        curr_embeds[i, :r] = fwd.inputs_embeds[i, n:]
+        curr_mask[i, :r]   = 1
+        curr_pos[i, :r]    = torch.arange(r, device=device, dtype=torch.long)
+        # 右侧 padding 的 pos_id 保持 0，mask=0 使其不被 attend
+
+    next_tokens   = torch.argmax(fwd.logits[:, -1, :], dim=-1)  # (B,)
+    all_generated = [next_tokens.unsqueeze(1)]
+    done          = (next_tokens == model.eos_token_id)
+
+    # 保守上限：max_real + steps < 1024
+    effective_max = min(max_new_tokens - 1, 1024 - max_real - 1)
+
+    for step in range(max(0, effective_max)):
+        if done.all():
+            break
+        new_emb     = model.embedding(next_tokens.unsqueeze(1))  # (B, 1, H)
+        curr_embeds = torch.cat([curr_embeds, new_emb], dim=1)
+        curr_mask   = torch.cat([curr_mask, curr_mask.new_ones(B, 1)], dim=1)
+        # 每个样本的新 position = 自身 real_len + 已生成步数（与 model.generate 一致）
+        new_pos     = (real_lens + step).unsqueeze(1)            # (B, 1)
+        curr_pos    = torch.cat([curr_pos, new_pos], dim=1)
+
+        out = model.base_causallm(
+            inputs_embeds=curr_embeds,
+            attention_mask=curr_mask,
+            position_ids=curr_pos,
+        )
+        next_tokens = torch.argmax(out.logits[:, -1, :], dim=-1)
+        next_tokens = next_tokens.masked_fill(done, model.eos_token_id)
+        all_generated.append(next_tokens.unsqueeze(1))
+        done = done | (next_tokens == model.eos_token_id)
+
+    return torch.cat(all_generated, dim=1)                              # (B, gen_len)
+
+
+@torch.no_grad()
 def evaluate_accuracy(model, raw_dataset, answers_list, tokenizer,
                       n_latent, latent_id, start_id, end_id, device, cfg,
                       collect_translations=False):
     """
-    逐样本生成答案（推理格式，无 COT），计算 answer accuracy。
+    批量生成答案（推理格式，无 COT），计算 answer accuracy。
 
     collect_translations=True 时，对前 n_translations_upload 条样本额外运行
-    翻译器，将结果记录到 wandb.Table 并返回。
+    翻译器（batch_size=1），其余样本使用批量生成（eval_batch_size）。
     """
     model.eval()
-    n_upload = cfg.get("n_translations_upload", 100)
-    num_eval = min(cfg.get("num_eval_samples", 300), len(raw_dataset))
-    eval_raw = raw_dataset.select(range(num_eval))
+    n_upload   = cfg.get("n_translations_upload", 100)
+    num_eval   = min(cfg.get("num_eval_samples", 300), len(raw_dataset))
+    max_new    = cfg.get("max_new_tokens_eval", 150)
+    eval_bs    = cfg.get("eval_batch_size", 8)
+    eval_raw   = raw_dataset.select(range(num_eval))
 
     eval_ds = get_direct_latent_eval_dataset(
         base_dataset=eval_raw,
@@ -170,7 +237,6 @@ def evaluate_accuracy(model, raw_dataset, answers_list, tokenizer,
             eval_ds = eval_ds.remove_columns(col)
 
     collator = DirectLatentCollator(tokenizer=tokenizer, latent_id=latent_id, p_mask=1.0)
-    loader   = DataLoader(eval_ds, batch_size=1, shuffle=False, collate_fn=collator)
 
     table = (
         wandb.Table(columns=[
@@ -183,13 +249,17 @@ def evaluate_accuracy(model, raw_dataset, answers_list, tokenizer,
 
     correct, total = 0, 0
 
-    for i, batch in enumerate(tqdm(loader, desc="  gen", leave=False)):
-        idx    = batch["idx"][0].item()
-        answer = answers_list[idx]
-        input_ids = batch["input_ids"].to(device)
-        max_new   = cfg.get("max_new_tokens_eval", 150)
+    # --- Phase 1: translation (batch_size=1，前 n_upload 条) ---
+    trans_end = min(n_upload, num_eval) if collect_translations else 0
+    if trans_end > 0:
+        trans_loader = DataLoader(
+            eval_ds.select(range(trans_end)), batch_size=1,
+            shuffle=False, collate_fn=collator,
+        )
+        for i, batch in enumerate(tqdm(trans_loader, desc="  trans", leave=False)):
+            idx       = batch["idx"][0].item()
+            input_ids = batch["input_ids"].to(device)
 
-        if collect_translations and i < n_upload:
             latent_pos  = (input_ids == latent_id).nonzero()
             first_lat   = latent_pos[0, 1].item() if len(latent_pos) > 0 else input_ids.shape[1]
             context_ids = input_ids[:, :first_lat]
@@ -200,29 +270,50 @@ def evaluate_accuracy(model, raw_dataset, answers_list, tokenizer,
                 labels=input_ids.clone(),
                 position_ids=torch.arange(input_ids.shape[1], device=device).unsqueeze(0),
             )
-            gen_ids = _greedy_from_forward(model, fwd, device, max_new)
+            gen_ids              = _greedy_from_forward(model, fwd, device, max_new)
             predicted_chain      = model.translate_latents(fwd.latent_states, context_ids, tokenizer)
             predicted_chain_text = predicted_chain[0] if predicted_chain else ""
 
-            gt_steps       = eval_raw[i]["steps"]
-            gt_chain_text  = "\n".join(str(s) for s in gt_steps)
-            question_text  = tokenizer.decode(context_ids[0], skip_special_tokens=True)
-        else:
-            gen_ids = model.generate(input_ids, tokenizer,
-                                     max_new_tokens=max_new, show_thoughts=False)
+            gt_steps      = eval_raw[i]["steps"]
+            gt_chain_text = "\n".join(str(s) for s in gt_steps)
+            question_text = tokenizer.decode(context_ids[0], skip_special_tokens=True)
 
-        text       = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        pred       = text.split("#")[-1].replace(",", "").strip()
-        is_correct = pred == answer
-        correct   += int(is_correct)
-        total     += 1
+            text       = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+            pred       = text.split("#")[-1].replace(",", "").strip()
+            answer     = answers_list[idx]
+            is_correct = pred == answer
+            correct   += int(is_correct)
+            total     += 1
 
-        if collect_translations and i < n_upload:
             table.add_data(
                 idx, question_text,
                 gt_chain_text, predicted_chain_text,
                 answer, pred, is_correct,
             )
+
+    # --- Phase 2: 批量 accuracy（剩余样本）---
+    if trans_end < num_eval:
+        acc_loader = DataLoader(
+            eval_ds.select(range(trans_end, num_eval)),
+            batch_size=eval_bs, shuffle=False, collate_fn=collator,
+        )
+        for batch in tqdm(acc_loader, desc="  gen", leave=False):
+            b_input_ids = batch["input_ids"].to(device)
+            b_attn_mask = batch["attention_mask"].to(device)
+            b_pos_ids   = batch["position_ids"].to(device)
+            b_idx       = batch["idx"]
+
+            gen_ids_batch = batch_greedy_generate(
+                model, b_input_ids, b_attn_mask, b_pos_ids, device, max_new)
+
+            for j in range(b_input_ids.shape[0]):
+                idx        = b_idx[j].item()
+                answer     = answers_list[idx]
+                text       = tokenizer.decode(gen_ids_batch[j], skip_special_tokens=True)
+                pred       = text.split("#")[-1].replace(",", "").strip()
+                is_correct = pred == answer
+                correct   += int(is_correct)
+                total     += 1
 
     accuracy = correct / total if total > 0 else 0.0
     return accuracy, table
