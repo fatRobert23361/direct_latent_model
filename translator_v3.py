@@ -77,6 +77,14 @@ class CoconutTranslator(nn.Module):
         else:
             full_labels = None
 
+        # 截断到 GPT-2 最大位置编码长度
+        max_seq_len = 1024
+        if full_embeds.shape[1] > max_seq_len:
+            full_embeds         = full_embeds[:, :max_seq_len, :]
+            full_attention_mask = full_attention_mask[:, :max_seq_len]
+            if full_labels is not None:
+                full_labels = full_labels[:, :max_seq_len]
+
         outputs = self.decoder(
             inputs_embeds=full_embeds,
             attention_mask=full_attention_mask,
