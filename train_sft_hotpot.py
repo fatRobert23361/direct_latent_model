@@ -84,25 +84,32 @@ def extract_answer(text):
 # Dataset 构建
 # ---------------------------------------------------------------------------
 
-def build_train_features(raw_dataset):
+def build_train_features(raw_dataset, max_seq_len=1024):
     """
     将 get_dataset() 返回的 Dataset 转为 list of dict：
         input_ids = question_tokens + cot_tokens + answer_tokens
         labels    = [-100]*len(question_tokens) + cot_tokens + answer_tokens
+    超过 max_seq_len 的样本直接丢弃（GPT-2 位置嵌入上限）。
     """
-    features = []
+    features, skipped = [], 0
     for sample in raw_dataset:
         q   = sample["question_tokenized"]
         cot = list(itertools.chain.from_iterable(sample["steps_tokenized"]))
         ans = sample["answer_tokenized"]
 
-        ids    = q + cot + ans
+        ids = q + cot + ans
+        if len(ids) > max_seq_len:
+            skipped += 1
+            continue
+
         labels = [-100] * len(q) + cot + ans
         features.append({
             "input_ids":      ids,
             "labels":         labels,
             "attention_mask": [1] * len(ids),
         })
+    if skipped:
+        print(f"  [build_train_features] skipped {skipped} samples exceeding {max_seq_len} tokens")
     return features
 
 
