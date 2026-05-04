@@ -34,7 +34,6 @@ p_mask_ramp_end_epoch: 85   # prosqa 是 49/60；这里 85/100 更缓慢
 # 评估
 num_eval_samples: 300
 max_new_tokens_eval: 200    # GSM8K 答案含计算过程，比 prosqa 更长
-eval_batch_size: 16
 n_translations_upload: 100
 
 # 权重加载 / 断点续训

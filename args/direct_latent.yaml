@@ -33,7 +33,6 @@ p_mask_ramp_end_epoch: 49  # p_mask 在 epoch 49 达到 1.0（之后保持不变
 # 评估
 num_eval_samples: 300
 max_new_tokens_eval: 150
-eval_batch_size: 16
 n_translations_upload: 100   # 每个 epoch 上传到 wandb 的 test 翻译条数
 
 # 权重加载 / 断点续训
