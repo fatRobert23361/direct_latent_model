@@ -1,35 +1,32 @@
 """
-train_sft_hotpot.py
+train_nocot_hotpot.py
 
-在 HotpotQA-COT 上对预训练 GPT-2 做带 COT 的监督微调（SFT）。
+在 HotpotQA 上训练 No-COT 基线模型（GPT-2，直接 Q→A，不含推理步骤）。
 
 训练格式：
-    {question}\\n{step1}\\n{step2}\\n...### {answer}<eos>
-    labels: question 部分 -100，step + answer 部分计算 loss
+    {question}\n### {answer}<eos>
+    labels: question 部分 -100，### answer<eos> 部分计算 loss
 
 评估格式：
-    prompt = {question}\\n → 模型自由生成 COT + answer
-    → 取最后一个 ### 之后的内容作为预测答案
+    prompt = {question}\n → 模型自由生成
+    → decode 完整序列，取最后一个 # 之后的内容作为预测答案
+    → 与 gold answer 直接字符串匹配（与 train_direct_latent.py 一致）
 
 每 epoch 评估：
-    val / test 的 Exact Match (EM) 和 Token F1
-    val / test 的 loss（完整序列）
+    val / test 的 accuracy（直接匹配）
+    val / test 的 loss
     前 n_samples_upload 条测试样本的生成结果上传 wandb Table
 
-配置文件：args/sft_hotpot.yaml
+配置文件：args/nocot_hotpot.yaml
 
 用法：
-    python train_sft_hotpot.py
-    python train_sft_hotpot.py --config args/sft_hotpot.yaml
+    python train_nocot_hotpot.py
+    python train_nocot_hotpot.py --config args/nocot_hotpot.yaml
 """
 
 import argparse
-import itertools
 import json
 import os
-import re
-import string
-from collections import Counter
 
 import torch
 import wandb
@@ -45,64 +42,26 @@ from utils import set_seed
 
 
 # ---------------------------------------------------------------------------
-# EM / F1（与 eval_baseline_hotpot.py 一致）
-# ---------------------------------------------------------------------------
-
-def normalize_answer(s):
-    def remove_articles(text):
-        return re.sub(r"\b(a|an|the)\b", " ", text)
-    def white_space_fix(text):
-        return " ".join(text.split())
-    def remove_punc(text):
-        return "".join(ch for ch in text if ch not in set(string.punctuation))
-    return white_space_fix(remove_articles(remove_punc(s.lower())))
-
-
-def exact_match(pred, gold):
-    return int(normalize_answer(pred) == normalize_answer(gold))
-
-
-def token_f1(pred, gold):
-    pred_tokens = normalize_answer(pred).split()
-    gold_tokens = normalize_answer(gold).split()
-    common      = Counter(pred_tokens) & Counter(gold_tokens)
-    num_same    = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(pred_tokens)
-    recall    = num_same / len(gold_tokens)
-    return 2 * precision * recall / (precision + recall)
-
-
-def extract_answer(text):
-    """取最后一个 ### 之后、第一个换行之前的内容作为预测答案。"""
-    after = text.split("###")[-1] if "###" in text else text
-    return after.split("\n")[0].strip()
-
-
-# ---------------------------------------------------------------------------
 # Dataset 构建
 # ---------------------------------------------------------------------------
 
 def build_train_features(raw_dataset, max_seq_len=1024):
     """
-    将 get_dataset() 返回的 Dataset 转为 list of dict：
-        input_ids = question_tokens + cot_tokens + answer_tokens
-        labels    = [-100]*len(question_tokens) + cot_tokens + answer_tokens
-    超过 max_seq_len 的样本直接丢弃（GPT-2 位置嵌入上限）。
+    No-COT 训练格式：question_tokens + answer_tokens
+    labels：question 部分 -100，answer 部分计算 loss
+    超过 max_seq_len 的样本丢弃。
     """
     features, skipped = [], 0
     for sample in raw_dataset:
         q   = sample["question_tokenized"]
-        cot = list(itertools.chain.from_iterable(sample["steps_tokenized"]))
         ans = sample["answer_tokenized"]
 
-        ids = q + cot + ans
+        ids = q + ans
         if len(ids) > max_seq_len:
             skipped += 1
             continue
 
-        labels = [-100] * len(q) + cot + ans
+        labels = [-100] * len(q) + ans
         features.append({
             "input_ids":      ids,
             "labels":         labels,
@@ -114,7 +73,6 @@ def build_train_features(raw_dataset, max_seq_len=1024):
 
 
 def build_eval_prompts(raw_dataset):
-    """评估 prompt：只含 question_tokens（让模型自由生成 COT + answer）。"""
     return [
         {
             "input_ids":      sample["question_tokenized"],
@@ -129,15 +87,14 @@ def build_eval_prompts(raw_dataset):
 # ---------------------------------------------------------------------------
 
 def collate_train(batch, tokenizer, label_pad=-100):
-    """右 padding，用于训练。"""
     max_len = max(len(f["input_ids"]) for f in batch)
     pad_id  = tokenizer.pad_token_id
     ids, lbls, masks = [], [], []
     for f in batch:
         n = max_len - len(f["input_ids"])
-        ids.append(f["input_ids"]      + [pad_id]    * n)
-        lbls.append(f["labels"]        + [label_pad] * n)
-        masks.append(f["attention_mask"] + [0]        * n)
+        ids.append(f["input_ids"]        + [pad_id]    * n)
+        lbls.append(f["labels"]          + [label_pad] * n)
+        masks.append(f["attention_mask"] + [0]         * n)
     return {
         "input_ids":      torch.tensor(ids,   dtype=torch.long),
         "labels":         torch.tensor(lbls,  dtype=torch.long),
@@ -146,7 +103,6 @@ def collate_train(batch, tokenizer, label_pad=-100):
 
 
 def collate_eval(batch, tokenizer):
-    """左 padding，用于 batch 生成。"""
     max_len = max(len(f["input_ids"]) for f in batch)
     pad_id  = tokenizer.pad_token_id
     ids, masks = [], []
@@ -176,14 +132,14 @@ def evaluate_loss(model, raw_dataset, tokenizer, device, cfg):
     )
     total, n = 0.0, 0
     for batch in tqdm(loader, desc="  loss", leave=False):
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch  = {k: v.to(device) for k, v in batch.items()}
         total += model(**batch).loss.item()
         n     += 1
     return total / n if n > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
-# 准确率评估
+# 准确率评估（与 train_direct_latent.py 逻辑一致）
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -195,30 +151,21 @@ def evaluate_accuracy(model, raw_dataset, answers_list, tokenizer,
 
     table = (
         wandb.Table(columns=[
-            "idx", "question", "gt_cot", "generated_text",
+            "idx", "question", "generated_text",
             "gt_answer", "pred_answer", "answer_match",
         ])
         if collect_samples else None
     )
 
     correct, total = 0, 0
-    batch_size = cfg.get("batch_size_eval", 8)
 
-    for batch_start in tqdm(range(0, len(raw_dataset), batch_size), desc="  gen", leave=False):
-        batch_end     = min(batch_start + batch_size, len(raw_dataset))
-        batch_prompts = prompts[batch_start:batch_end]
-        batch_golds   = answers_list[batch_start:batch_end]
+    for i, (prompt, gold) in enumerate(tqdm(zip(prompts, answers_list), total=len(prompts), desc="  gen", leave=False)):
+        input_ids = torch.tensor([prompt["input_ids"]],      dtype=torch.long).to(device)
+        attn_mask = torch.tensor([prompt["attention_mask"]], dtype=torch.long).to(device)
 
-        batch     = collate_eval(batch_prompts, tokenizer)
-        input_ids = batch["input_ids"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
-
-        max_new = min(
-            cfg.get("max_new_tokens_eval", 200),
-            1024 - input_ids.shape[1],
-        )
+        max_new = min(cfg.get("max_new_tokens_eval", 50), 1024 - input_ids.shape[1])
         if max_new <= 0:
-            total += len(batch_golds)
+            total += 1
             continue
 
         gen_ids = model.generate(
@@ -229,19 +176,16 @@ def evaluate_accuracy(model, raw_dataset, answers_list, tokenizer,
             pad_token_id=tokenizer.eos_token_id,
         )
 
-        for j, (gold, prompt) in enumerate(zip(batch_golds, batch_prompts)):
-            # 解码完整序列（prompt + 生成），与 train_direct_latent.py 一致
-            gen_text   = tokenizer.decode(gen_ids[j], skip_special_tokens=True)
-            pred       = gen_text.split("#")[-1].replace(",", "").strip()
-            is_correct = int(pred == gold)
-            correct   += is_correct
-            total     += 1
+        # 解码完整序列（prompt + 生成），与 train_direct_latent.py 一致
+        gen_text   = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+        pred       = gen_text.split("#")[-1].replace(",", "").strip()
+        is_correct = int(pred == gold)
+        correct   += is_correct
+        total     += 1
 
-            i = batch_start + j
-            if collect_samples and i < n_upload:
-                q_text = tokenizer.decode(prompt["input_ids"], skip_special_tokens=True)
-                gt_cot = "\n".join(str(s) for s in raw_dataset[i]["steps"])
-                table.add_data(i, q_text, gt_cot, gen_text, gold, pred, is_correct)
+        if collect_samples and i < n_upload:
+            q_text = tokenizer.decode(prompt["input_ids"], skip_special_tokens=True)
+            table.add_data(i, q_text, gen_text, gold, pred, is_correct)
 
     accuracy = correct / total if total > 0 else 0.0
     return accuracy, table
@@ -258,7 +202,7 @@ def save_checkpoint(model, optimizer, epoch, val_acc, save_path, name):
             "model_state_dict":     model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch":                epoch,
-            "val_em":               val_acc,
+            "val_acc":              val_acc,
         },
         os.path.join(save_path, f"{name}_best.pt"),
     )
@@ -321,7 +265,7 @@ def train(cfg_path):
     if resume_ckpt and "optimizer_state_dict" in resume_ckpt:
         optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
 
-    warmup_steps = cfg.get("warmup_steps", 200)
+    warmup_steps = cfg.get("warmup_steps", 100)
     scheduler    = LambdaLR(
         optimizer,
         lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps)),
@@ -332,10 +276,10 @@ def train(cfg_path):
     if not debug:
         wandb.init(project=cfg["project"], name=cfg["name"], config=cfg)
 
-    grad_accum  = cfg.get("gradient_accumulation_steps", 4)
-    num_epochs  = cfg.get("num_epochs", 10)
-    start_epoch = (resume_ckpt.get("epoch", -1) + 1) if resume_ckpt else 0
-    global_step = 0
+    grad_accum   = cfg.get("gradient_accumulation_steps", 4)
+    num_epochs   = cfg.get("num_epochs", 15)
+    start_epoch  = (resume_ckpt.get("epoch", -1) + 1) if resume_ckpt else 0
+    global_step  = 0
     best_val_acc = 0.0
 
     eval_kw = dict(tokenizer=tokenizer, device=device, cfg=cfg)
@@ -420,6 +364,6 @@ def train(cfg_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="args/sft_hotpot.yaml")
+    parser.add_argument("--config", default="args/nocot_hotpot.yaml")
     args = parser.parse_args()
     train(args.config)

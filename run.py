@@ -205,6 +205,16 @@ def main():
         configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000
     )
 
+    question_test = [d["question"] for d in json.load(open(configs.test_path))]
+    answers_test = [
+        d["answer"].replace(",", "").strip() for d in json.load(open(configs.test_path))
+    ]
+    cot_test = ["\n".join(d["steps"]) for d in json.load(open(configs.test_path))]
+
+    base_dataset_test = get_dataset(
+        configs.test_path, tokenizer, max_size=32 if configs.debug else 100000000
+    )
+
     if not configs.only_eval:
         base_dataset_train = get_dataset(
             configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000
@@ -261,6 +271,25 @@ def main():
             batch_size=1,
             collate_fn=collator,
             sampler=DistributedSampler(dataset_gen_val, shuffle=False),
+        )
+
+        dataset_gen_test = get_question_latent_dataset(
+            scheduled_stage,
+            base_dataset_test,
+            configs,
+            start_id,
+            latent_id,
+            end_id,
+            no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
+        )
+
+        test_gen_dataloader = torch.utils.data.DataLoader(
+            dataset_gen_test,
+            num_workers=1,
+            pin_memory=True,
+            batch_size=1,
+            collate_fn=collator,
+            sampler=DistributedSampler(dataset_gen_test, shuffle=False),
         )
 
         if not configs.only_eval:
@@ -504,6 +533,72 @@ def main():
 
         if wandb_run:
             wandb_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
+
+        # test generation accuracy
+        total_length = len(test_gen_dataloader)
+
+        pbar = tqdm(
+            colour="green", desc=f"Test Set Accuracy", total=total_length, dynamic_ncols=True
+        )
+        cor_t, cor_cot_t, total_t = (
+            torch.tensor(0, device=rank),
+            torch.tensor(0, device=rank),
+            torch.tensor(0, device=rank),
+        )
+
+        with torch.no_grad():
+            parallel_model.module.eval()
+            for idx, batch in enumerate(test_gen_dataloader):
+                test_idx = batch["idx"][0]
+
+                batch = {
+                    k: v.to(rank)
+                    for k, v in batch.items()
+                    if v != None and k not in ["idx", "position_ids"]
+                }
+
+                assert len(batch["input_ids"]) == 1
+                answer   = answers_test[test_idx.cpu().item()]
+                answer_cot = cot_test[test_idx.cpu().item()]
+
+                total_t += 1
+
+                outputs = parallel_model.module.generate(
+                    **batch,
+                    max_new_tokens=max_new_tokens,
+                    synced_gpus=not configs.only_eval,
+                )
+
+                text_output   = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                answer_output = text_output.split("#")[-1].replace(",", "").strip()
+                cot_output    = (
+                    ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
+                )
+
+                cor_t     += answer_output == answer
+                cor_cot_t += cot_output == answer_cot
+
+                pbar.update(1)
+                pbar.set_description(
+                    f"Test set accuracy: {round(float(cor_t.detach().float() / total_t.detach().float()), 2)}"
+                )
+
+            pbar.close()
+
+        dist.all_reduce(cor_cot_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cor_t,     op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_t,   op=dist.ReduceOp.SUM)
+
+        cor_cot_t = cor_cot_t.item()
+        cor_t     = cor_t.item()
+        total_t   = total_t.item()
+        if rank == 0:
+            print(f"Accuracy on test set: {cor_t} / {total_t} = {cor_t/total_t}")
+            print(f"CoT match on test set: {cor_cot_t} / {total_t} = {cor_cot_t/total_t}")
+        sys.stdout.flush()
+
+        if wandb_run:
+            wandb_run.log({"test/acc": cor_t / total_t, "test/cot_em": cor_cot_t / total_t})
 
         if configs.only_eval:
             break
