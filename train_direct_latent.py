@@ -20,6 +20,7 @@ train_direct_latent.py
 """
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -454,6 +455,10 @@ def train(cfg_path):
             best_val_acc = val_acc
             save_best_checkpoint(model, cfg["save_path"], cfg["name"], epoch, val_acc)
             print(f"  → New best val {val_acc * 100:.2f}% (p_mask={p_mask:.3f}) — checkpoint saved.")
+
+        # 评估结束后释放 GPU 缓存，防止内存碎片在下一轮训练触发 OOM
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if not debug:
         wandb.finish()

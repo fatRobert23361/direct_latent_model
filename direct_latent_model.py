@@ -269,7 +269,11 @@ class DirectLatentModel(nn.Module):
         generated_tokens = [next_token]
         curr_embeds = inputs_embeds
 
-        for _ in range(max_new_tokens - 1):
+        # 防止 position_id 超过 GPT-2 的 n_positions(1024) 上限触发 CUDA assert
+        n_positions = getattr(self.base_causallm.config, "n_positions", 1024)
+        max_steps = min(max_new_tokens - 1, n_positions - input_ids.shape[1] - 1)
+
+        for _ in range(max(0, max_steps)):
             new_token_embed = self.embedding(torch.tensor([[next_token]], device=device))
             curr_embeds = torch.cat([curr_embeds, new_token_embed], dim=1)
 
