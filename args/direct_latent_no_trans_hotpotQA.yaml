@@ -1,0 +1,41 @@
+project: coconut-hotpot
+save_path: ./models/direct_latent_no_trans_hotpotQA
+name: direct_latent_no_trans_hotpotQA
+
+# 模型参数
+model_id: openai-community/gpt2
+n_latent: 6
+use_translator: false        # baseline：无 translator，纯 coconut latent 训练
+
+# 数据路径
+train_path: data/hotpot_cot_train.json
+val_path:   data/hotpot_cot_valid.json
+test_path:  data/hotpot_cot_test.json
+
+# 训练超参（与 direct_latent.yaml 保持一致）
+lr: !!float "1e-4"
+weight_decay: 0.01
+batch_size_training: 8
+gradient_accumulation_steps: 4
+num_epochs: 60
+warmup_steps: 100
+
+# COT 遮蔽调度（与 direct_latent.yaml 保持一致）
+p_mask_start:          0.0
+p_mask_end:            1.0
+p_mask_warmup_epochs:  5
+p_mask_ramp_end_epoch: 49
+
+# 评估
+num_eval_samples: 5000
+max_new_tokens_eval: 300
+n_translations_upload: 0     # 无 translator，不上传翻译
+
+# 权重加载 / 断点续训
+resume_from_checkpoint: /home/haoyang/haoyang/coconut/models/direct_latent_no_trans_hotpotQA/direct_latent_no_trans_hotpotQA_best.pt
+
+# 随机种子
+seed: 42
+
+# 调试
+debug: false

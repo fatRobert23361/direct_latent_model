@@ -1,14 +1,24 @@
 """
 eval_latent_replacement.py
 
-测试将第一个 latent token 的 embedding 替换为其他数据的 latent 或随机 embedding
-对模型推理准确率的影响。
+测试 vanilla COCONUT 中替换单个 latent 位置对推理准确率的影响。
+
+实验设计：
+  baseline        — 不替换，正常推理
+  replace_pos_k   — 只替换第 k 个 latent（k=0..stage-1），其余不变
+                    替换方式分两种：random（随机正态）/ other（另一条样本的同位置向量）
+
+输出：
+  - results JSON：每个位置 × 两种替换方式的准确率
+  - 折线图：x 轴 = 替换位置，y 轴 = 准确率，baseline 画水平参考线
 
 用法:
     python eval_latent_replacement.py \
         --checkpoint models/prosqa-coconut/checkpoint_38 \
         --val_path data/prosqa_test.json \
-        --stage 6
+        --stage 6 \
+        --output_json results/latent_replacement.json \
+        --output_plot  results/latent_replacement.png
 """
 
 import argparse
@@ -16,6 +26,7 @@ import json
 import os
 import random
 
+import matplotlib.pyplot as plt
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -23,6 +34,10 @@ from coconut import Coconut
 from dataset import get_dataset, get_question_latent_dataset, MyCollator
 from utils import Config
 
+
+# ---------------------------------------------------------------------------
+# 配置与模型加载
+# ---------------------------------------------------------------------------
 
 def build_config(val_path, stage):
     return Config({
@@ -69,29 +84,68 @@ def load_model(checkpoint_path, device):
     return model, tokenizer, latent_id, start_id, end_id
 
 
-@torch.no_grad()
-def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_tokens=128):
-    """
-    与 model.generate() 逻辑相同，但在 pass_idx==0 时，将第一个 latent 的
-    hidden state 替换为 replacement_embed。
+# ---------------------------------------------------------------------------
+# 收集所有样本的全部 latent 向量池
+# ---------------------------------------------------------------------------
 
-    Args:
-        model:              Coconut 模型实例
-        input_ids:          shape (1, seq_len)，包含 <|latent|> 占位符
-        replacement_embed:  shape (1, hidden_size)，用于替换第一个 latent 的向量
-                            传 None 则不替换（退化为正常 generate）
-        max_new_tokens:     最大生成 token 数
+@torch.no_grad()
+def collect_all_latents(model, dataloader, n_latent, device):
+    """
+    遍历 dataloader，对每个样本运行一次 forward，
+    收集全部 n_latent 个 latent 位置的 hidden state。
 
     Returns:
-        tokens: List[int]，包含输入和生成的全部 token id
+        latent_pool: List[ Tensor(n_latent, hidden_size) | None ]
     """
-    device = input_ids.device
+    latent_pool = []
+
+    for batch in dataloader:
+        input_ids      = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        position_ids   = torch.arange(input_ids.shape[1], dtype=torch.long, device=device).unsqueeze(0)
+        labels         = input_ids.clone()
+
+        outputs = model.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            position_ids=position_ids,
+        )
+
+        # latent_states[k]: (n_samples_with_latent, 1, hidden_size) 或 None
+        vecs = []
+        for ls in outputs.latent_states:
+            if ls is not None:
+                vecs.append(ls[0, 0, :].detach().cpu())   # (hidden_size,)
+
+        if len(vecs) == n_latent:
+            latent_pool.append(torch.stack(vecs))          # (n_latent, hidden_size)
+        else:
+            latent_pool.append(None)
+
+    return latent_pool
+
+
+# ---------------------------------------------------------------------------
+# 带单位置替换的前向 + 贪心解码
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_with_single_replacement(model, input_ids, replace_pos, replacement_embed,
+                                     device, max_new_tokens=128):
+    """
+    只替换第 replace_pos 个 latent（0-based）的向量为 replacement_embed。
+    其余 latent 照常由 hidden state 填充。
+
+    replace_pos:      int，0-based；-1 表示不替换（baseline）
+    replacement_embed: Tensor (hidden_size,) 或 None
+    """
     tokens = input_ids[0].detach().tolist()
 
     latent_indices = (input_ids == model.latent_token_id).nonzero()
 
-    if len(latent_indices) == 0:
-        # 没有 latent token，直接调用普通 generate
+    if len(latent_indices) == 0 or replace_pos < 0 or replacement_embed is None:
+        # 正常 generate（baseline）
         out = model.generate(
             input_ids,
             attention_mask=torch.ones_like(input_ids),
@@ -105,14 +159,13 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
     ]
     max_n_latents = max(len(l) for l in latent_lists)
 
-    inputs_embeds = model.embedding(input_ids)
+    inputs_embeds  = model.embedding(input_ids)
     attention_mask = torch.ones_like(input_ids)
-    position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=device).reshape(1, -1)
+    position_ids   = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=device).unsqueeze(0)
 
     next_compute_range = (0, latent_indices[:, 1].min().item())
     kv_cache = None
 
-    # ---- 多 pass 前向，逐个填充 latent 位置 ----
     for pass_idx in range(max_n_latents):
         if kv_cache is None:
             outputs = model.base_causallm(
@@ -145,20 +198,20 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
         )
 
         filling_indices = [
-            (i, latent_lists[i][pass_idx])
-            for i in range(len(latent_lists))
-            if len(latent_lists[i]) > pass_idx
+            (batch_idx, latent_lists[batch_idx][pass_idx])
+            for batch_idx in range(len(latent_lists))
+            if len(latent_lists[batch_idx]) > pass_idx
         ]
 
-        # 拆成 list of list 避免 in-place 操作
+        # 逐位置修改 inputs_embeds（避免 in-place 操作）
         tensor_list = [
             [inputs_embeds[b, p, :] for p in range(inputs_embeds.shape[1])]
             for b in range(inputs_embeds.shape[0])
         ]
 
         for batch_idx, token_idx in filling_indices:
-            if pass_idx == 0 and replacement_embed is not None:
-                # 替换第一个 latent 的向量
+            if pass_idx == replace_pos:
+                # 替换该轮 latent 向量
                 tensor_list[batch_idx][token_idx] = replacement_embed.to(device)
             else:
                 # 正常：用前一个位置的 hidden state 填充
@@ -185,7 +238,7 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
         output_hidden_states=False,
     )
 
-    # 贪婪解码生成答案
+    # 贪婪解码
     next_token = torch.argmax(final_outputs.logits[0, -1]).item()
     tokens.append(next_token)
     new_inputs_embeds = torch.cat(
@@ -209,96 +262,90 @@ def generate_with_replaced_latent(model, input_ids, replacement_embed, max_new_t
     return tokens
 
 
-@torch.no_grad()
-def collect_first_latents(model, dataloader, device):
-    """
-    遍历 dataloader，对每个样本运行一次 forward，
-    收集第一个 latent 位置（pass_idx=0）的 hidden state。
-
-    Returns:
-        latents: List[Tensor]，每个元素 shape (hidden_size,)
-        idxs:    List[int]，对应的样本 idx
-    """
-    latents = []
-    idxs = []
-
-    for batch in dataloader:
-        test_idx = batch["idx"][0].item()
-        input_ids     = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        position_ids  = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=device).reshape(1, -1)
-        labels        = input_ids.clone()
-
-        outputs = model.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            position_ids=position_ids,
-        )
-
-        if outputs.latent_states and outputs.latent_states[0] is not None:
-            # latent_states[0]: (1, 1, hidden_size) for batch_size=1
-            latent_vec = outputs.latent_states[0][0, 0, :]  # (hidden_size,)
-            latents.append(latent_vec)
-        else:
-            latents.append(None)
-
-        idxs.append(test_idx)
-
-    return latents, idxs
-
+# ---------------------------------------------------------------------------
+# 评估
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_mode(model, tokenizer, dataloader, answers_val, device,
-                  latent_pool=None, mode="baseline"):
+def evaluate_replace_pos(model, tokenizer, dataloader, answers_val, latent_pool,
+                         replace_pos, mode, device):
     """
-    mode:
-      "baseline"   — 不替换，正常 generate
-      "random"     — 第一个 latent 替换为 N(0,1) 随机向量（每条数据独立采样）
-      "other"      — 第一个 latent 替换为数据集内另一条数据的 latent
-    latent_pool: List[Tensor|None]，collect_first_latents 的结果（mode=="other" 时必须提供）
+    replace_pos: 0-based，替换第几个 latent；-1 表示 baseline（不替换）
+    mode: "random" 或 "other"（baseline 时忽略）
     """
     hidden_size = model.embedding.embedding_dim
     correct, total = 0, 0
-    all_pool = [v for v in latent_pool if v is not None] if latent_pool else []
 
     for sample_i, batch in enumerate(dataloader):
-        test_idx = batch["idx"][0].item()
-        answer   = answers_val[test_idx]
+        test_idx  = batch["idx"][0].item()
+        answer    = answers_val[test_idx]
         input_ids = batch["input_ids"].to(device)
 
-        # 确定替换向量
-        if mode == "baseline":
+        if replace_pos < 0:
             replacement = None
         elif mode == "random":
             replacement = torch.randn(hidden_size, device=device)
-        elif mode == "other":
-            # 从 pool 中随机选一个不是自己的 latent
-            own_latent = latent_pool[sample_i] if latent_pool else None
+        else:  # "other"
             candidates = [
-                v for j, v in enumerate(latent_pool)
+                v[replace_pos] for j, v in enumerate(latent_pool)
                 if j != sample_i and v is not None
             ]
-            if candidates:
-                replacement = random.choice(candidates).to(device)
-            else:
-                replacement = torch.randn(hidden_size, device=device)
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+            replacement = (random.choice(candidates).to(device)
+                           if candidates else torch.randn(hidden_size, device=device))
 
-        tokens = generate_with_replaced_latent(
-            model, input_ids, replacement_embed=replacement, max_new_tokens=128
+        tokens = generate_with_single_replacement(
+            model, input_ids, replace_pos, replacement, device, max_new_tokens=128
         )
 
         text_output   = tokenizer.decode(tokens, skip_special_tokens=True)
         answer_output = text_output.split("#")[-1].replace(",", "").strip()
-
         correct += int(answer_output == answer)
         total   += 1
 
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy, correct, total
+    return correct / total if total > 0 else 0.0, correct, total
 
+
+# ---------------------------------------------------------------------------
+# 绘图
+# ---------------------------------------------------------------------------
+
+def plot_results(baseline_acc, results_random, results_other, n_latent, output_path):
+    positions   = list(range(1, n_latent + 1))   # 1-based for display
+    accs_random = [results_random[k]["accuracy"] * 100 for k in range(n_latent)]
+    accs_other  = [results_other[k]["accuracy"]  * 100 for k in range(n_latent)]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.axhline(baseline_acc * 100, color="steelblue", linewidth=2,
+               linestyle="--", label=f"baseline ({baseline_acc*100:.1f}%)")
+    ax.plot(positions, accs_random, marker="o", linewidth=2, markersize=8,
+            color="tomato",     label="replace w/ random")
+    ax.plot(positions, accs_other,  marker="s", linewidth=2, markersize=8,
+            color="darkorange", label="replace w/ other sample")
+
+    for x, y in zip(positions, accs_random):
+        ax.annotate(f"{y:.1f}%", (x, y), textcoords="offset points",
+                    xytext=(0, 8), ha="center", fontsize=9, color="tomato")
+    for x, y in zip(positions, accs_other):
+        ax.annotate(f"{y:.1f}%", (x, y), textcoords="offset points",
+                    xytext=(0, -14), ha="center", fontsize=9, color="darkorange")
+
+    ax.set_xlabel("Replaced Latent Position (1-based)", fontsize=13)
+    ax.set_ylabel("Accuracy (%)", fontsize=13)
+    ax.set_title("Vanilla COCONUT: Effect of Single-Position Latent Replacement\n(ProsQA test set)",
+                 fontsize=13)
+    ax.set_xticks(positions)
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=11)
+    ax.grid(axis="y", linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    print(f"Plot saved to {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -307,6 +354,7 @@ def main():
     parser.add_argument("--stage",       type=int, default=6,
                         help="评估时使用的 latent stage 数（即注入多少个 latent token）")
     parser.add_argument("--output_json", default="results/latent_replacement.json")
+    parser.add_argument("--output_plot", default="results/latent_replacement.png")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed",        type=int, default=42)
     args = parser.parse_args()
@@ -314,7 +362,10 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
+    out_dir = os.path.dirname(args.output_json)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     device = torch.device(args.device)
     print(f"Device: {device}")
 
@@ -340,46 +391,63 @@ def main():
         no_special_marker=False,
     )
 
-    collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+    collator   = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=1, shuffle=False, num_workers=2, collate_fn=collator
     )
 
-    # ---- Step 1: 收集所有样本的第一个 latent hidden state ----
-    print(f"\nCollecting first-latent hidden states (stage={args.stage}) ...")
-    latent_pool, sample_idxs = collect_first_latents(model, dataloader, device)
+    # ---- Step 1: 收集所有样本的全部 latent hidden state ----
+    print(f"\nCollecting all latent states (stage={args.stage}) ...")
+    latent_pool = collect_all_latents(model, dataloader, args.stage, device)
     valid_count = sum(1 for v in latent_pool if v is not None)
     print(f"  Collected {valid_count}/{len(latent_pool)} valid latents")
 
-    # ---- Step 2: 三种模式分别评估 ----
-    results = {}
-    for mode in ("baseline", "random", "other"):
-        print(f"\n--- Mode: {mode} ---")
-        acc, correct, total = evaluate_mode(
-            model, tokenizer, dataloader, answers_val, device,
-            latent_pool=latent_pool, mode=mode,
-        )
-        results[mode] = {"accuracy": acc, "correct": correct, "total": total}
-        print(f"  {correct}/{total} = {acc*100:.2f}%")
+    # ---- Step 2: baseline ----
+    print("\n--- baseline (no replacement) ---")
+    baseline_acc, bc, bt = evaluate_replace_pos(
+        model, tokenizer, dataloader, answers_val, latent_pool,
+        replace_pos=-1, mode="random", device=device,
+    )
+    print(f"  {bc}/{bt} = {baseline_acc*100:.2f}%")
 
-    # ---- 保存结果 ----
+    # ---- Step 3: 逐位置替换 ----
+    results_random = {}
+    results_other  = {}
+
+    for pos in range(args.stage):
+        for mode, store in [("random", results_random), ("other", results_other)]:
+            print(f"\n--- replace pos={pos+1}/{args.stage}, mode={mode} ---")
+            acc, correct, total = evaluate_replace_pos(
+                model, tokenizer, dataloader, answers_val, latent_pool,
+                replace_pos=pos, mode=mode, device=device,
+            )
+            store[pos] = {"accuracy": acc, "correct": correct, "total": total}
+            drop = (baseline_acc - acc) * 100
+            print(f"  {correct}/{total} = {acc*100:.2f}%  (drop: {drop:+.2f}pp)")
+
+    # ---- 保存 JSON ----
     output = {
         "checkpoint": args.checkpoint,
-        "stage": args.stage,
-        "results": results,
+        "stage":      args.stage,
+        "baseline":   {"accuracy": baseline_acc, "correct": bc, "total": bt},
+        "random":     {str(k + 1): v for k, v in results_random.items()},
+        "other":      {str(k + 1): v for k, v in results_other.items()},
     }
     with open(args.output_json, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nResults saved to {args.output_json}")
 
-    print("\n=== Summary ===")
-    for mode, r in results.items():
-        print(f"  {mode:10s}: {r['accuracy']*100:.2f}%  ({r['correct']}/{r['total']})")
+    plot_results(baseline_acc, results_random, results_other, args.stage, args.output_plot)
 
-    baseline_acc = results["baseline"]["accuracy"]
-    for mode in ("random", "other"):
-        drop = (baseline_acc - results[mode]["accuracy"]) * 100
-        print(f"  Accuracy drop ({mode} vs baseline): {drop:+.2f}pp")
+    # ---- 汇总 ----
+    print("\n=== Summary ===")
+    print(f"  {'pos':>4}  {'random':>10}  {'drop':>8}  |  {'other':>10}  {'drop':>8}")
+    print(f"  {'base':>4}  {baseline_acc*100:>9.2f}%  {'—':>8}  |  {baseline_acc*100:>9.2f}%  {'—':>8}")
+    for pos in range(args.stage):
+        ra = results_random[pos]["accuracy"]
+        oa = results_other[pos]["accuracy"]
+        print(f"  {pos+1:>4}  {ra*100:>9.2f}%  {(baseline_acc-ra)*100:>+7.2f}pp  |  "
+              f"{oa*100:>9.2f}%  {(baseline_acc-oa)*100:>+7.2f}pp")
 
 
 if __name__ == "__main__":

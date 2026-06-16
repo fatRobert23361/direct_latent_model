@@ -8,9 +8,9 @@ n_latent: 6              # 固定 latent token 数量，不随 stage 变化
 lambda_translator: 0.5   # translator loss 权重（无 stage 缩放）
 
 # 数据路径
-train_path: data/gsm_train.json
-val_path: data/gsm_valid.json
-test_path: data/gsm_test.json
+train_path: data/prosqa_train.json
+val_path:   data/prosqa_valid.json
+test_path:  data/prosqa_test.json
 
 # 训练超参
 lr: !!float "1e-4"

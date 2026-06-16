@@ -1,185 +1,287 @@
-# Coconut
+# Coconut — Reasoning in a Continuous Latent Space
 
-The code base is the official implementation of [Training Large Language Models to Reason in a Continuous Latent Space](https://arxiv.org/abs/2412.06769).
+This repository extends the official implementation of
+[Training Large Language Models to Reason in a Continuous Latent Space](https://arxiv.org/abs/2412.06769)
+with two additional contributions:
 
-![coconut](assets/coconut.png)
+- **DirectLatentModel**: a fixed-latent-count model trained with a continuous `p_mask` schedule
+  and an auxiliary Translator loss that forces genuine representational load on the latent tokens.
+- **Latent replacement experiments**: position-wise perturbation evaluations that test whether
+  latent tokens are causally load-bearing.
 
-## Getting Started
-Clone repo:
+---
+
+## Repository File Guide
+
+### Keep — core source files
+
+| File | Role |
+|------|------|
+| `coconut.py` | Vanilla COCONUT model (multi-stage curriculum) |
+| `direct_latent_model.py` | DirectLatentModel + Translator |
+| `translator_v3.py` | GPT-2-based Translator decoder |
+| `dataset.py` | Dataset for `run.py` (ProsQA / GSM8K vanilla COCONUT) |
+| `direct_latent_dataset.py` | Dataset for `train_direct_latent.py` |
+| `utils.py` | Config wrapper and seed utilities |
+| `run.py` | Training loop for vanilla COCONUT and ProsQA/GSM8K baselines |
+| `train_direct_latent.py` | Training loop for DirectLatentModel (all datasets) |
+| `train_sft_hotpot.py` | CoT SFT baseline for HotpotQA (alternative, reports EM + F1) |
+| `train_nocot_hotpot.py` | No-CoT baseline for HotpotQA (alternative, reports EM + F1) |
+| `eval_latent_replacement.py` | Latent replacement eval — vanilla COCONUT |
+| `eval_latent_replacement_direct.py` | Latent replacement eval — DirectLatentModel |
+| `eval_latent_sweep.py` | Accuracy vs. latent count sweep — vanilla COCONUT |
+| `eval_latent_sweep_direct.py` | Accuracy vs. latent count sweep — DirectLatentModel |
+| `eval_cot_accuracy.py` | One-shot CoT model evaluation (GSM8K / ProsQA) |
+| `eval_baseline_hotpot.py` | Raw GPT-2 (no fine-tuning) baseline on HotpotQA |
+| `prepare_hotpot_cot.py` | Build HotpotQA-CoT dataset from fsiddiqui2 corpus |
+| `prepare_hotpotqa.py` | HotpotQA preprocessing utilities |
+| `preprocessing/` | GSM8K and ProntoQA preprocessing scripts |
+
+### Delete — redundant files
+
+```bash
+# Dead code after mixed.py chain removal
+git rm mixed.py mixed_dataset.py train.py \
+       eval_latent_replacement_hybrid.py train_uniform_sweep.py \
+       args/mixed_coconut.yaml
+
+# Stale configs (placeholder paths or superseded)
+git rm args/prontoqa_coconut.yaml args/prontoqa_coconut_eval.yaml \
+       args/hotpot_no_thoughts.yaml
 ```
-git clone git@github.com:facebookresearch/coconut.git
-cd coconut
-```
 
-Setup environment:
-```
+---
+
+## Environment Setup
+
+```bash
 conda create --name coconut python=3.12
 conda activate coconut
 pip install -r requirements.txt
+wandb login          # required before any training run
 ```
 
-The code relies on [wandb](https://wandb.ai/site/) for logging. Please log in your wandb account following this [document](https://docs.wandb.ai/ref/cli/wandb-login/) before running any experiments.
+All multi-GPU training uses `torchrun`. Commands below assume **4 × A100 (80 GB)**.
+Adjust `--nproc_per_node`, `batch_size_training`, and `gradient_accumulation_steps` for
+other hardware.
 
-## Data
+---
 
-The data for training and evaluation should be presented as a json file like below:
+## Data Preparation
 
-```python
-[
-  {
-    "question": "...",
-    "answer": "...",
-    "steps": ["...", "...", ...]
-  },
-  ...
-]
-```
+### ProsQA (already bundled)
 
-The file should contain a list of data points. Each data point is composed of a question (str), an answer (str), and a list of steps (str), where each of them is a string.
-
-For example, you can download and process the [GSM8K](https://arxiv.org/abs/2110.14168) dataset (with [augmented training and validation sets](https://github.com/da03/Internalize_CoT_Step_by_Step/tree/e06a32ee5e4cd117171daeb4755d2a97ece62761/data/gsm8k)) by running:
-
-```bash
-bash preprocessing/gsm_icot.bash
-```
-
-## Arguments
-
-The configuration of a run should be specified in a yaml file (an example can be found [here](args/gsm_coconut.yaml)).
-
-- **General settings**
-
-  - **project**: Project name for wandb
-  - **save_path**: Your path to store the checkpoints
-  - **only_eval**: If true, only load a model and test on the data from `val_path` (must used along with `load_model_path`). Otherwise, train the model on `train_path` and test on `val_path` after every epoch.
-
-- **Method**
-  - **coconut**: Train coconut model
-  - **cot**: Train cot model
-  - **no_thoughts**: Train coconut (w/o thought) model
-  - **no_cot**: Train no-cot model
-
-- **Training settings**
-
-  - **c_thought**: Number of continuous thoughts for each reasoning step
-  - **epochs_per_stage**: Number of epochs for every training stage
-  - **max_latent_stage**: The maximum number of training stages (in addition to the initial stage)
-  - **pad_latent_to_max**: If the number of reasoning steps is fewer than the index of current training stage, pad the number of continuous thoughts.
-  - **save_only_improve**: Save the model only when there the best validation accuracy is updated. Recommended to set `False` for Coconut model training, because otherwise the checkpoints in the last stage might now get saved.
-  - **uniform_prob**: The probability to mix data from other stages. 0 for standard experiment, 0.3 for analysis experiment.
-  - **model_id**: Huggingface model id to load as the initialization, e.g., `openai-community/gpt2`
-  - **load_model_path**: The path to a checkpoint to load. Used in two cases: (1) for evaluation (2) to initialize coconut from a CoT-tuned model.
-  - **seed**: Random seed.
-  - **resume**: The epoch to resume. Can be used when we want to skip the initial training stages.
-  - **bf16**: Whether to use bf16 training.
-  - **train_path**: Path to the training set.
-  - **val_path**: Path to the validation or test set (depending on `only_eval`)
-  - **reset_optimizer**: Whether to reset the optimizer when swtiching training stages.
-  - **batch_size_training**: Batch size to train the model per GPU.
-  - **debug**: If true, there is no wandb and model saving. A subset of data will be used.
-  - **gradient_accumulation_steps**: Gradient accumulation steps
-  - **num_epochs**: Maximum training epoches.
-  - **lr**: Learning rate
-  - **weight_decay**: Weight decay
-
-
-## Training
-
-Run the following commands (replacing `N_GPUS` and `PATH_TO_ARGS`):
-
-```
-torchrun --nnodes 1 --nproc_per_node N_GPUS run.py PATH_TO_ARGS
-```
-
-## Reproducing Experiments
-
-Here we provide instructions to reproduce our experiments in the paper.
-
-All the commands below assume 4 * A100 (80GB) GPUs. You may change the corresponding arguments in the config file (`batch_size_training`, `gradient_accumulation_steps`) and `nproc_per_node` when launching the run, to adapt your resources.
-
+Pre-processed files are in `data/prosqa_{train,valid,test}.json`. No extra step needed.
 
 ### GSM8K
 
-Preprocessing data:
-
 ```bash
 bash preprocessing/gsm_icot.bash
 ```
 
-First train the model with CoT (as the stage 0 training)
+Produces `data/gsm_{train,valid,test}.json`.
+The training set uses the augmented iCoT corpus (~385k samples).
+
+### HotpotQA
 
 ```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_cot.yaml
+python prepare_hotpot_cot.py   # downloads fsiddiqui2/hotpot-qa-cot-reasoning and builds CoT chains
+python prepare_hotpotqa.py     # filters to ≤1024 tokens and writes train/valid/test splits
 ```
 
-Select a checkpoint as the initialization of Coconut (the validation accuracy is expected to be around 40%). Replace the `load_model_path` in the [args/gsm_coconut.yaml](args/gsm_coconut.yaml) with your selected checkpoint, and run:
+Produces `data/hotpot_cot_{train,valid,test}.json`.
 
-```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_coconut.yaml
-```
+---
 
-Find the checkpoint with best validation accuracy, and put the path as `load_model_path` in [args/gsm_coconut_eval.yaml](args/gsm_coconut_eval.yaml). To evaluate:
-
-```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_coconut_eval.yaml
-```
-
-### ProntoQA
-
-Please clone the official [github repo](https://github.com/asaparov/prontoqa/tree/f0145b867b3c106285ec9ea1941a3f6eb7c6162d) of [ProntoQA](https://arxiv.org/pdf/2210.01240) and generate a raw dataset with:
-
-```bash
-cd prontoqa
-python run_experiment.py --model-name json --model-size dummy --ordering random --num-trials 10000 --few-shot-examples 0 --ontology fictional --min-hops 5 --max-hops 5 --hops-skip 1
-```
-
-Then copy the generated `5hop_0shot_random.json` file to `data` directory, and preprocess the dataset with:
-
-```bash
-python preprocessing/prontoqa.py
-```
-
-
-Then run the following to train the model:
-```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/prontoqa_coconut.yaml
-```
-
-Find the checkpoint with best validation accuracy, and put the path as `load_model_path` in [args/prosqa_coconut_eval.yaml](args/prosqa_coconut_eval.yaml). To evaluate:
-
-```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut_eval.yaml
-```
-
+## Experiment 1 — Baselines (CoT and No-CoT)
 
 ### ProsQA
 
-The ProsQA dataset is at [data/prosqa_*.json](data).
-
-Then run the following to train the model:
 ```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut.yaml
+# CoT baseline
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_cot.yaml
+
+# No-CoT baseline
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_no_thoughts.yaml
 ```
 
-Find the checkpoint with best validation accuracy, and put the path as `load_model_path` in [args/prosqa_coconut_eval.yaml](args/prosqa_coconut_eval.yaml). To evaluate:
+### GSM8K
 
 ```bash
+# CoT baseline  (also serves as warm-start checkpoint for vanilla COCONUT)
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_cot.yaml
+
+# No-CoT baseline — create args/gsm_no_thoughts.yaml by copying prosqa_no_thoughts.yaml
+# and setting:
+#   train_path: data/gsm_train.json
+#   val_path:   data/gsm_valid.json
+#   test_path:  data/gsm_test.json
+#   name:       gsm-no-thoughts
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_no_thoughts.yaml
+```
+
+> **Note:** `args/gsm_cot.yaml` sets `name: nihaoyang2002-kth-royal-institute-of-technology`
+> (a legacy experiment name). Rename the field if desired before running.
+
+### HotpotQA
+
+```bash
+# CoT baseline
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/hotpot_cot.yaml
+
+# No-CoT baseline
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/hotpot_no_thoughts.yaml
+```
+
+> **Note:** `run.py` reports accuracy as direct string match (same metric as ProsQA/GSM8K),
+> not the normalized EM + token F1 used in the original HotpotQA benchmark.
+
+---
+
+## Experiment 2 — Vanilla COCONUT
+
+Supported on **ProsQA** and **GSM8K** only.
+
+### ProsQA
+
+```bash
+# Train
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut.yaml
+
+# Evaluate — fill in the best checkpoint path in args/prosqa_coconut_eval.yaml first:
+#   load_model_path: models/prosqa-coconut/checkpoint_XX
 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut_eval.yaml
 ```
 
+### GSM8K
 
+GSM8K vanilla COCONUT requires a CoT warm-start checkpoint.
 
+1. Train the CoT baseline (Experiment 1) and identify a checkpoint where validation
+   accuracy is ~40%.
+2. Set `load_model_path` in `args/gsm_coconut.yaml` to that checkpoint path.
+3. Run:
+
+```bash
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_coconut.yaml
+
+# Evaluate — fill load_model_path in args/gsm_coconut_eval.yaml first
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_coconut_eval.yaml
+```
+
+### Key hyperparameters (`args/prosqa_coconut.yaml`)
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `max_latent_stage` | 6 | Replace up to 6 CoT steps with latent tokens |
+| `c_thought` | 1 | One latent token per replaced step |
+| `epochs_per_stage` | 5 | Epochs trained at each curriculum stage |
+| `uniform_prob` | 0.3 | Probability of sampling lower-stage data (regularisation) |
+| `reset_optimizer` | true | Optimizer reset at each stage transition |
+
+---
+
+## Experiment 3 — DirectLatentModel
+
+Supported on **ProsQA**, **GSM8K**, and **HotpotQA**.
+All variants use `train_direct_latent.py` (single-process, no `torchrun` needed).
+
+### With Translator auxiliary loss
+
+```bash
+# ProsQA — create args/direct_latent_prosqa.yaml (copy direct_latent_no_trans_prosqa.yaml,
+#           remove use_translator: false or set use_translator: true, set save_path/name)
+python train_direct_latent.py --config args/direct_latent_prosqa.yaml
+
+# GSM8K
+python train_direct_latent.py --config args/direct_latent_gsm8k.yaml
+
+# HotpotQA
+python train_direct_latent.py --config args/direct_latent_hotpot.yaml
+```
+
+### Without Translator (ablation)
+
+```bash
+python train_direct_latent.py --config args/direct_latent_no_trans_prosqa.yaml
+python train_direct_latent.py --config args/direct_latent_no_trans_gsm8k.yaml
+python train_direct_latent.py --config args/direct_latent_no_trans_hotpotQA.yaml
+```
+
+### Key hyperparameters (`args/direct_latent_no_trans_prosqa.yaml` / `direct_latent_gsm8k.yaml`)
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `n_latent` | 6 | Fixed number of latent tokens (no curriculum) |
+| `p_mask_start` | 0.0 | CoT always visible at epoch 0 |
+| `p_mask_end` | 1.0 | CoT fully masked at ramp end |
+| `p_mask_warmup_epochs` | 5 (ProsQA) / 15 (GSM8K) | Epochs before ramp begins |
+| `p_mask_ramp_end_epoch` | 49 (ProsQA) / 85 (GSM8K) | Epoch at which `p_mask` reaches 1.0 |
+| `lambda_translator` | 0.5 | Translator loss weight |
+| `use_translator` | true / false | Enable or disable Translator auxiliary loss |
+
+---
+
+## Evaluation — Latent Replacement Experiment
+
+The replacement experiment substitutes each latent position with (a) Gaussian noise or
+(b) a vector from an unrelated sample, measuring accuracy drop at each position.
+
+```bash
+# Vanilla COCONUT
+python eval_latent_replacement.py \
+    --checkpoint models/prosqa-coconut/checkpoint_XX \
+    --val_path   data/prosqa_test.json \
+    --stage      6 \
+    --output_json results/latent_replacement.json \
+    --output_plot results/latent_replacement.png
+
+# DirectLatentModel
+python eval_latent_replacement_direct.py \
+    --checkpoint models/direct_latent_prosqa/best.pt \
+    --val_path   data/prosqa_test.json \
+    --output_json results/latent_replacement_direct.json
+```
+
+## Evaluation — Latent Sweep
+
+Measures accuracy as a function of the number of active latent tokens (0 → n_latent).
+
+```bash
+# Vanilla COCONUT
+python eval_latent_sweep.py \
+    --checkpoint models/prosqa-coconut/checkpoint_XX \
+    --val_path   data/prosqa_test.json \
+    --output_json results/latent_sweep.json
+
+# DirectLatentModel
+python eval_latent_sweep_direct.py \
+    --checkpoint models/direct_latent_prosqa/best.pt \
+    --val_path   data/prosqa_test.json \
+    --output_json results/latent_sweep_direct.json
+```
+
+---
+
+## Logging
+
+All training scripts log to [Weights & Biases](https://wandb.ai). Set `debug: true` in
+any config file to disable wandb and checkpoint saving (useful for quick sanity checks).
+
+---
 
 ## Citation
-If you use this code base in your research, please cite our paper with the following BibTex entry:
+
 ```bibtex
 @article{hao2024training,
-  title={Training Large Language Models to Reason in a Continuous Latent Space},
-  author={Hao, Shibo and Sukhbaatar, Sainbayar and Su, DiJia and Li, Xian and Hu, Zhiting and Weston, Jason and Tian, Yuandong},
-  journal={arXiv preprint arXiv:2412.06769},
-  year={2024}
+  title   = {Training Large Language Models to Reason in a Continuous Latent Space},
+  author  = {Hao, Shibo and Sukhbaatar, Sainbayar and Su, DiJia and Li, Xian
+             and Hu, Zhiting and Weston, Jason and Tian, Yuandong},
+  journal = {arXiv preprint arXiv:2412.06769},
+  year    = {2024}
 }
 ```
 
 ## License
+
 This code is released under the MIT license (see [LICENSE](LICENSE)).

@@ -1,9 +1,9 @@
 # No-thoughts baseline for ProsQA (direct Q->A, no reasoning steps)
 # need 4 gpus
 
-project: coconut-hotpot
+project: coconut-baselines
 save_path: /home/haoyang/haoyang/coconut/models
-name: no-thoughts-hotpot
+name: prosqa-no-thoughts
 
 only_eval: False
 
@@ -21,14 +21,13 @@ save_only_improve: True
 uniform_prob: 0.0
 model_id: openai-community/gpt2
 load_model_path: None
-seed: 42
+seed: 0
 resume: 0
 bf16: False
-train_path: data/hotpot_cot_train.json
-val_path: data/hotpot_cot_valid.json
-test_path: data/hotpot_cot_test.json
+train_path: data/gsm8k_train.json
+val_path: data/gsm8k_valid.json
 reset_optimizer: False
-batch_size_training: 8
+batch_size_training: 32
 debug: False
 gradient_accumulation_steps: 1
 num_epochs: 50

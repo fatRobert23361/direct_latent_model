@@ -1,16 +1,16 @@
-# No-thoughts baseline for ProsQA (direct Q->A, no reasoning steps)
+# CoT baseline for HotpotQA
 # need 4 gpus
 
 project: coconut-hotpot
 save_path: /home/haoyang/haoyang/coconut/models
-name: no-thoughts-hotpot
+name: cot-hotpot
 
 only_eval: False
 
 coconut: False
-cot: False
+cot: True
 no_thoughts: False
-no_cot: True
+no_cot: False
 
 c_thought: 0
 epochs_per_stage: 1
